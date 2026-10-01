@@ -610,6 +610,30 @@ class TestNodeAddresses:
 
 
 class TestCreateNode:
+    def test_delegates_to_create_node_with_resources_and_labels(self):
+        """``ray up``'s head-node bootstrap calls ``create_node`` directly
+        (see ``ray.autoscaler._private.commands.get_or_create_head_node``),
+        bypassing ``create_node_with_resources_and_labels``.
+        """
+        provider = _provider()
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[])
+        fake_client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        )
+        fake_client.workspaces.create.side_effect = [
+            {"id": "ws-1", "name": "node-1", "status": "pending"},
+        ]
+        tags = {
+            TAG_RAY_CLUSTER_NAME: CLUSTER_NAME,
+            TAG_RAY_USER_NODE_TYPE: "worker",
+            TAG_RAY_NODE_KIND: NODE_KIND_WORKER,
+        }
+
+        with _patched_from_env(fake_client):
+            result = provider.create_node({}, tags, 1)
+
+        assert result == {"ws-1": {"id": "ws-1", "name": "node-1", "status": "pending"}}
+
     def test_creates_requested_count_sequentially_in_one_client_session(self):
         provider = _provider()
         fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[])

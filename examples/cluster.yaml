@@ -4,7 +4,8 @@
 cluster_name: src-ray-example
 
 provider:
-  type: src_ray_provider.node_provider.ResearchCloudNodeProvider
+  type: external
+  module: src_ray_provider.node_provider.ResearchCloudNodeProvider
   co_name: Example CO
   wallet_name: Example Wallet
 
@@ -12,6 +13,18 @@ auth:
   ssh_user: ray
   # ssh_private_key: ~/.ssh/...
   # ssh_public_key: ~/.ssh/...
+
+# The "external" provider type only ships a minimal default config, so these
+# keys (normally filled in by each built-in provider's defaults.yaml) must be
+# set explicitly or `ray up` fails with a KeyError while merging commands.
+initialization_commands: []
+setup_commands: []
+worker_setup_commands: []
+file_mounts: {}
+cluster_synced_files: []
+file_mounts_sync_continuously: false
+rsync_exclude: []
+rsync_filter: []
 
 # TESTING ONLY: replace the placeholder before launching. The token is written
 # to a head-only file with owner-only permissions, then supplied to `ray start`
@@ -27,6 +40,14 @@ head_start_ray_commands:
     RESEARCH_CLOUD_TOKEN="$(cat ~/.researchcloud-token)" ray start --head
     --port=6379 --dashboard-host=0.0.0.0
     --autoscaling-config=~/ray_bootstrap_config.yaml
+
+worker_start_ray_commands:
+  - ray stop
+  - ray start --address=$RAY_HEAD_IP:6379
+
+# Global cap on worker nodes across the whole cluster; the "external"
+# provider type has no default, so this must be set explicitly.
+max_workers: 4
 
 head_node_type: head
 available_node_types:

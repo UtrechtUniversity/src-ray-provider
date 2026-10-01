@@ -1,3 +1,15 @@
+Metadata-Version: 2.4
+Name: src-ray-provider
+Version: 0.1.0
+Summary: Ray autoscaler node provider for SURF ResearchCloud
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: ray<3,>=2.9
+Requires-Dist: researchcloud-api @ git+https://github.com/UtrechtUniversity/src-api-sdk.git
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
+Requires-Dist: ruff; extra == "test"
+
 # SRC Ray Provider
 
 Ray autoscaler node provider for SURF ResearchCloud (SRC). This project is
@@ -31,13 +43,8 @@ The provider type is:
 
 ```yaml
 provider:
-  type: external
-  module: src_ray_provider.node_provider.ResearchCloudNodeProvider
+  type: src_ray_provider.node_provider.ResearchCloudNodeProvider
 ```
-
-Ray's built-in provider types are a fixed set (`aws`, `gcp`, `local`, etc.); a
-custom provider class must be loaded via the `external` type with `module` set
-to the dotted class path, not as the `type` value directly.
 
 The `provider` block also requires `co_name` and `wallet_name`. Ray's
 `head_node_type` and `available_node_types` are used to derive SRC sizing.

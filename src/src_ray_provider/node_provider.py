@@ -212,6 +212,23 @@ class ResearchCloudNodeProvider(NodeProvider):
             }
         return options
 
+    def create_node(
+        self,
+        node_config: Dict[str, Any],
+        tags: Dict[str, str],
+        count: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Create up to ``count`` SRC workspaces for one Ray node type.
+
+        The autoscaler monitor calls ``create_node_with_resources_and_labels``
+        for worker scale-up, but ``ray up``'s head-node bootstrap
+        (``ray.autoscaler._private.commands.get_or_create_head_node``) calls
+        ``create_node`` directly, bypassing the resources/labels variant. SRC
+        has no workspace-creation fields for either, so this just delegates
+        with empty resources/labels.
+        """
+        return self.create_node_with_resources_and_labels(node_config, tags, count, {}, {})
+
     def create_node_with_resources_and_labels(
         self,
         node_config: Dict[str, Any],

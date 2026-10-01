@@ -1,0 +1,6 @@
+ray<3,>=2.9
+researchcloud-api @ git+https://github.com/UtrechtUniversity/src-api-sdk.git
+
+[test]
+pytest
+ruff

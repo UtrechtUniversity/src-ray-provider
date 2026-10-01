@@ -1,2 +1,3 @@
 cluster.yaml
 uv.lock
+**/**/__pycache__
