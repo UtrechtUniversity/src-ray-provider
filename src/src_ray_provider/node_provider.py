@@ -294,16 +294,17 @@ class ResearchCloudNodeProvider(NodeProvider):
             generated_private_key, generated_public_key = ResearchCloudNodeProvider._ensure_generated_keypair(
                 cluster_config.get("cluster_name")
             )
-            auth_config["ssh_public_key"] = Path(generated_public_key).read_text(encoding="utf-8").strip()
-            auth_config["ssh_private_key"] = Path(generated_private_key).read_text(encoding="utf-8").strip()
-            public_key = auth_config["ssh_public_key"]
+            auth_config["ssh_public_key"] = str(generated_public_key)
+            if auth_config["ssh_private_key"] != "~/ray_bootstrap_key.pem":
+                auth_config["ssh_private_key"] = str(generated_private_key)
 
         if "ray_public_key" not in provider_config:
-            public_key_path = Path(public_key).expanduser()
             provider_config["ray_public_key"] = (
-                public_key_path.read_text(encoding="utf-8").strip()
-                if public_key_path.is_file()
-                else public_key.strip()
+                Path(auth_config["ssh_public_key"]).read_text(encoding="utf-8").strip()
+            )
+        if "ray_private_key" not in provider_config:
+            provider_config["ray_private_key"] = (
+                Path(auth_config["ssh_private_key"]).read_text(encoding="utf-8").strip()
             )
 
         if "node_types" not in provider_config:
@@ -373,6 +374,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         )
         self.network_name_hint = self._config_value(provider_config, "network_name_hint", optional=True)
         self.ray_public_key = self._config_value(provider_config, "ray_public_key", optional=True)
+        self.ray_private_key = self._config_value(provider_config, "ray_private_key", optional=True)
         self.workspace_creation_timeout = self._timeout_value(
             provider_config, "workspace_creation_timeout", DEFAULT_WORKSPACE_CREATION_TIMEOUT
         )
