@@ -253,13 +253,18 @@ class ResearchCloudNodeProvider(NodeProvider):
         node_type = tags.get(TAG_RAY_USER_NODE_TYPE)
         if not isinstance(node_type, str) or node_type not in self._node_type_configs:
             raise ValueError(f"node creation tags must include a configured {TAG_RAY_USER_NODE_TYPE!r}")
-        expected_tags = {
-            TAG_RAY_CLUSTER_NAME: self.cluster_name,
-            TAG_RAY_NODE_KIND: self._kind_for_node_type(node_type),
-        }
-        for tag, expected_value in expected_tags.items():
-            if tags.get(tag) != expected_value:
-                raise ValueError(f"node creation tag {tag!r} must be {expected_value!r}, got {tags.get(tag)!r}")
+        # TAG_RAY_CLUSTER_NAME is intentionally not validated here: Ray never
+        # includes it in the tags passed to create_node(_with_resources_and_labels)
+        # for either the head node (ray.autoscaler._private.commands) or workers
+        # (ray.autoscaler._private.node_launcher) — every built-in provider just
+        # assumes it is always self.cluster_name instead of expecting callers to
+        # supply it.
+        expected_node_kind = self._kind_for_node_type(node_type)
+        if tags.get(TAG_RAY_NODE_KIND) != expected_node_kind:
+            raise ValueError(
+                f"node creation tag {TAG_RAY_NODE_KIND!r} must be {expected_node_kind!r}, "
+                f"got {tags.get(TAG_RAY_NODE_KIND)!r}"
+            )
 
         del node_config, resources, labels
         return asyncio.run(self._create_nodes(node_type, count))
