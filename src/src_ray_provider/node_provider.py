@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import threading
 import uuid
@@ -71,6 +72,8 @@ from researchcloud.utils.flavours import match_size_flavour, validate_size_flavo
 DEFAULT_HEAD_CATALOG_ITEM_NAME = "Ray Head Node"
 DEFAULT_WORKER_CATALOG_ITEM_NAME = "Ray Worker"
 DEFAULT_OS_FLAVOUR_NAME = "Ubuntu 24.04"
+DEFAULT_WORKSPACE_CREATION_TIMEOUT = 1800
+WORKSPACE_CREATION_POLL_INTERVAL = 5
 PROVIDER_INSTALL_COMMAND = (
     'python3 -m pip install --upgrade '
     '"src-ray-provider @ git+https://github.com/UtrechtUniversity/src-ray-provider.git"'
@@ -159,6 +162,9 @@ class ResearchCloudNodeProvider(NodeProvider):
         )
         self.network_name_hint = self._config_value(provider_config, "network_name_hint", optional=True)
         self.ray_public_key = self._config_value(provider_config, "ray_public_key", optional=True)
+        self.workspace_creation_timeout = self._timeout_value(
+            provider_config, "workspace_creation_timeout", DEFAULT_WORKSPACE_CREATION_TIMEOUT
+        )
 
         self.head_node_type = self._config_value(provider_config, "head_node_type")
         self._node_type_configs, self._node_type_lookup = self._parse_node_types(provider_config)
@@ -194,6 +200,18 @@ class ResearchCloudNodeProvider(NodeProvider):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"provider config {key!r} must be a non-empty string")
         return value.strip()
+
+    @staticmethod
+    def _timeout_value(provider_config: Mapping[str, Any], key: str, default: float) -> float:
+        value = provider_config.get(key, default)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"provider config {key!r} must be a positive number of seconds")
+        return float(value)
 
     def _workspace_creation_options(self, node_type: str) -> dict[str, Any]:
         node_type_config = self._node_type_configs[node_type]
@@ -293,8 +311,34 @@ class ResearchCloudNodeProvider(NodeProvider):
                     continue
 
                 workspace_id = self._workspace_id(workspace)
+                workspace = await self._wait_for_workspace_creation(client, workspace_id, workspace)
                 created[workspace_id] = workspace
         return created
+
+    async def _wait_for_workspace_creation(
+        self,
+        client: ResearchCloudClient,
+        workspace_id: str,
+        workspace: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Wait for SRC to finish its ``creating`` phase before returning a node to Ray."""
+        if self._workspace_status(workspace) != "creating":
+            return workspace
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.workspace_creation_timeout
+        while self._workspace_status(workspace) == "creating":
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"SRC workspace {workspace_id!r} remained in 'creating' state for "
+                    f"{self.workspace_creation_timeout:g} seconds"
+                )
+            await asyncio.sleep(min(WORKSPACE_CREATION_POLL_INTERVAL, remaining))
+            workspace = await client.workspaces.get(workspace_id)
+            self._workspace_id(workspace)
+            self._workspace_status(workspace)
+        return workspace
 
     def _default_catalog_item_name(self, node_type: str) -> str:
         return DEFAULT_HEAD_CATALOG_ITEM_NAME if node_type == self.head_node_type else DEFAULT_WORKER_CATALOG_ITEM_NAME

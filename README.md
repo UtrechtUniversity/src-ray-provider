@@ -44,6 +44,18 @@ The `provider` block also requires `co_name` and `wallet_name`. Ray's
 Provide `auth.ssh_public_key` for the SRC catalog item's `ray_public_key`
 interactive parameter.
 
+When an SRC workspace is returned in the `creating` state, the provider polls
+until that state changes before returning the node to Ray. The wait is bounded
+by `provider.workspace_creation_timeout` (seconds), which defaults to 1800:
+
+```yaml
+provider:
+  workspace_creation_timeout: 1800
+```
+
+The provider checks every five seconds and raises a timeout error if the
+workspace remains `creating` past this limit.
+
 To run the example, replace its SRC names, SSH settings, and test token. The
 sample token setup is intentionally insecure and is only for disposable
 testing. See [`MANUAL_TEST_PLAN.md`](MANUAL_TEST_PLAN.md).

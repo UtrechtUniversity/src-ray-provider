@@ -18,6 +18,7 @@ from src_ray_provider.node_provider import (
     DEFAULT_HEAD_CATALOG_ITEM_NAME,
     DEFAULT_OS_FLAVOUR_NAME,
     DEFAULT_WORKER_CATALOG_ITEM_NAME,
+    DEFAULT_WORKSPACE_CREATION_TIMEOUT,
     ResearchCloudNodeProvider,
     sanitize_name_component,
 )
@@ -47,6 +48,7 @@ def test_provider_configuration_uses_defaults():
     assert provider.cloud_name == DEFAULT_CLOUD_NAME
     assert provider.os_flavour_name == DEFAULT_OS_FLAVOUR_NAME
     assert provider.network_name_hint is None
+    assert provider.workspace_creation_timeout == DEFAULT_WORKSPACE_CREATION_TIMEOUT
     assert provider._workspace_creation_options("head") == {
         "catalog_item_name": DEFAULT_HEAD_CATALOG_ITEM_NAME,
         "cloud_name": DEFAULT_CLOUD_NAME,
@@ -87,6 +89,12 @@ def test_provider_configuration_allows_overrides():
         "use_private_network": True,
         "network_name_hint": "ray-private",
     }
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True, "30"])
+def test_workspace_creation_timeout_must_be_a_positive_finite_number(timeout):
+    with pytest.raises(ValueError, match="workspace_creation_timeout"):
+        ResearchCloudNodeProvider(_provider_config(workspace_creation_timeout=timeout), CLUSTER_NAME)
 
 
 @pytest.mark.parametrize("key", ["co_name", "wallet_name", "head_node_type"])
@@ -633,6 +641,86 @@ class TestCreateNode:
             result = provider.create_node({}, tags, 1)
 
         assert result == {"ws-1": {"id": "ws-1", "name": "node-1", "status": "pending"}}
+
+    def test_creates_head_node_without_a_cluster_name_tag(self):
+        """Neither ``ray.autoscaler._private.commands.get_or_create_head_node``
+        nor ``ray.autoscaler._private.node_launcher`` ever put
+        ``TAG_RAY_CLUSTER_NAME`` into the tags passed to ``create_node``: every
+        built-in provider treats the cluster name as always being
+        ``self.cluster_name`` instead of expecting callers to supply it, and
+        this provider must do the same.
+        """
+        provider = _provider()
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[])
+        fake_client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        )
+        fake_client.workspaces.create.side_effect = [
+            {"id": "ws-1", "name": "node-1", "status": "pending"},
+        ]
+        tags = {
+            TAG_RAY_USER_NODE_TYPE: "head",
+            TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
+        }
+
+        with _patched_from_env(fake_client):
+            result = provider.create_node({}, tags, 1)
+
+        assert result == {"ws-1": {"id": "ws-1", "name": "node-1", "status": "pending"}}
+
+    def test_waits_for_workspace_to_leave_creating_state(self):
+        provider = _provider(workspace_creation_timeout=30)
+        creating = {"id": "ws-1", "name": "node-1", "status": "creating"}
+        running = {"id": "ws-1", "name": "node-1", "status": "running"}
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={})
+        fake_client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        )
+        fake_client.workspaces.create.return_value = creating
+        fake_client.workspaces.get = AsyncMock(side_effect=[creating, running])
+        tags = {
+            TAG_RAY_USER_NODE_TYPE: "head",
+            TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
+        }
+
+        with (
+            _patched_from_env(fake_client),
+            patch("src_ray_provider.node_provider.asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            result = provider.create_node({}, tags, 1)
+
+        assert result == {"ws-1": running}
+        assert fake_client.workspaces.get.await_count == 2
+        assert sleep.await_count == 2
+
+    def test_workspace_creation_wait_raises_after_configured_timeout(self):
+        provider = _provider(workspace_creation_timeout=5)
+        creating = {"id": "ws-1", "name": "node-1", "status": "creating"}
+        clock = SimpleNamespace(now=0.0)
+        fake_loop = SimpleNamespace(time=lambda: clock.now)
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={})
+        fake_client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        )
+        fake_client.workspaces.create.return_value = creating
+        fake_client.workspaces.get = AsyncMock(return_value=creating)
+        tags = {
+            TAG_RAY_USER_NODE_TYPE: "head",
+            TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
+        }
+
+        async def advance_clock(seconds):
+            clock.now += seconds
+
+        with (
+            _patched_from_env(fake_client),
+            patch("src_ray_provider.node_provider.asyncio.get_running_loop", return_value=fake_loop),
+            patch("src_ray_provider.node_provider.asyncio.sleep", side_effect=advance_clock),
+            pytest.raises(TimeoutError, match="remained in 'creating' state for 5 seconds"),
+        ):
+            provider.create_node({}, tags, 1)
+
+        assert fake_client.workspaces.get.await_count == 1
 
     def test_creates_requested_count_sequentially_in_one_client_session(self):
         provider = _provider()
