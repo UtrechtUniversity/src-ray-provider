@@ -9,6 +9,7 @@ from ray.autoscaler.tags import (
     NODE_KIND_HEAD,
     NODE_KIND_WORKER,
     TAG_RAY_CLUSTER_NAME,
+    TAG_RAY_LAUNCH_CONFIG,
     TAG_RAY_NODE_KIND,
     TAG_RAY_USER_NODE_TYPE,
 )
@@ -321,6 +322,7 @@ class _FakeWorkspacesService:
         self.list = AsyncMock(return_value=workspaces)
         self.build_create_payload_from_names = AsyncMock()
         self.create = AsyncMock()
+        self.delete = AsyncMock()
         self._get_by_id = get_by_id
 
     async def get(self, workspace_id: str) -> dict:
@@ -592,6 +594,90 @@ class TestNodeTags:
 
         with _patched_from_env(fake_client):
             assert provider.node_tags("ws-missing") == {}
+
+
+class TestNodeTagCache:
+    """Covers persisting mutable Ray tags (e.g. TAG_RAY_LAUNCH_CONFIG) that
+    SRC workspaces have nowhere to store, since losing them makes every
+    node look permanently out-of-date to Ray's `_should_create_new_head`
+    and causes `ray up` to destroy and recreate an otherwise healthy node
+    on every invocation.
+    """
+
+    def test_set_node_tags_persists_and_is_merged_into_node_tags(self):
+        provider = _provider()
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[_head_workspace("ws-1")])
+
+        with _patched_from_env(fake_client):
+            provider.non_terminated_nodes({})
+            provider.set_node_tags("ws-1", {TAG_RAY_LAUNCH_CONFIG: "hash-123"})
+
+            assert provider.node_tags("ws-1") == {
+                TAG_RAY_CLUSTER_NAME: CLUSTER_NAME,
+                TAG_RAY_USER_NODE_TYPE: "head",
+                TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
+                TAG_RAY_LAUNCH_CONFIG: "hash-123",
+            }
+
+    def test_derived_identity_tags_win_over_a_stale_cached_value(self):
+        provider = _provider()
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[_head_workspace("ws-1")])
+
+        with _patched_from_env(fake_client):
+            provider.non_terminated_nodes({})
+            # A cached write can never override a derived identity tag, even
+            # if a caller tried to set a conflicting value for it.
+            provider.set_node_tags("ws-1", {TAG_RAY_USER_NODE_TYPE: "worker"})
+
+            assert provider.node_tags("ws-1")[TAG_RAY_USER_NODE_TYPE] == "head"
+
+    def test_cached_tags_survive_a_new_provider_instance_for_the_same_cluster(self):
+        """Simulates a separate `ray` command invocation (e.g. a later `ray
+        up`) reusing the same local cache file on the same machine.
+        """
+        workspace = _head_workspace("ws-1")
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[workspace], get_by_id={"ws-1": workspace})
+
+        provider_a = _provider()
+        with _patched_from_env(fake_client):
+            provider_a.non_terminated_nodes({})
+            provider_a.set_node_tags("ws-1", {TAG_RAY_LAUNCH_CONFIG: "hash-123"})
+
+        provider_b = _provider()
+        with _patched_from_env(fake_client):
+            assert provider_b.node_tags("ws-1")[TAG_RAY_LAUNCH_CONFIG] == "hash-123"
+
+    def test_create_node_caches_the_tags_ray_passed_in(self):
+        provider = _provider()
+        created_workspace = {"id": "ws-1", "name": "node-1", "status": "running"}
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={"ws-1": created_workspace})
+        fake_client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        )
+        fake_client.workspaces.create.side_effect = [created_workspace]
+        tags = {
+            TAG_RAY_USER_NODE_TYPE: "head",
+            TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
+            TAG_RAY_LAUNCH_CONFIG: "hash-abc",
+        }
+
+        with _patched_from_env(fake_client):
+            provider.create_node({}, tags, 1)
+            assert provider.node_tags("ws-1")[TAG_RAY_LAUNCH_CONFIG] == "hash-abc"
+
+    def test_terminate_node_discards_its_cached_tags(self):
+        provider = _provider()
+        workspace = _head_workspace("ws-1")
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[workspace], get_by_id={"ws-1": workspace})
+
+        with _patched_from_env(fake_client):
+            provider.non_terminated_nodes({})
+            provider.set_node_tags("ws-1", {TAG_RAY_LAUNCH_CONFIG: "hash-123"})
+            provider.terminate_node("ws-1")
+
+        fake_client_after = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={})
+        with _patched_from_env(fake_client_after):
+            assert provider.node_tags("ws-1") == {}
 
 
 class TestNodeAddresses:

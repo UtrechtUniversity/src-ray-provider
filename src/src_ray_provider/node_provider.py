@@ -40,18 +40,41 @@ duplication for avoiding any persisted/free-text tag storage:
   belongs to this cluster. Cluster membership is determined by a naming
   convention applied when a workspace is created: its ``name`` is prefixed
   with ``ray-{cluster_name}-`` (sanitized to fit SRC's naming rules).
+
+Mutable Ray tags (notably ``TAG_RAY_LAUNCH_CONFIG``, written once at node
+creation and read back by ``ray up``/the autoscaler on every subsequent
+invocation to decide whether a node is out-of-date) have nowhere to live in
+SRC itself: the workspace API has no generic tag/label/metadata store. Since
+losing ``TAG_RAY_LAUNCH_CONFIG`` makes every node look permanently
+out-of-date -- causing ``ray up`` to terminate and recreate an otherwise
+healthy head node on every single run -- these tags are cached in a local
+JSON file under ``~/.cache/src_ray_provider/node_tags/<cluster_name>.json``
+(see ``_NodeTagCache``). This is necessarily local to the machine/account
+running a given Ray command: a laptop running ``ray up`` and the autoscaler
+monitor running on the head node each keep their own cache file, so this
+only fixes repeat invocations from the *same* machine (which is the normal
+case for both ``ray up`` and the head-resident autoscaler monitor).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import math
+import os
 import re
+import tempfile
 import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fcntl is POSIX-only; Ray targets POSIX hosts
+    fcntl = None
 
 from ray.autoscaler.node_provider import NodeProvider
 from ray.autoscaler.tags import (
@@ -84,6 +107,100 @@ HTTP_NOT_FOUND = 404
 _NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_\-]+")
 _WORKSPACE_NAME_MAX_LENGTH = 100
 logger = logging.getLogger(__name__)
+
+NODE_TAG_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "node_tags"
+
+
+@contextlib.contextmanager
+def _locked_cache_file(lock_path: Path):
+    """Hold an exclusive, cross-process advisory lock while touching a cache file.
+
+    Guards against concurrent read-modify-write races between, e.g., a
+    ``ray up`` invocation and the autoscaler monitor running against the
+    same cache file. A no-op on platforms without ``fcntl`` (non-POSIX);
+    Ray itself targets POSIX hosts for both the CLI and head node.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None:  # pragma: no cover - fcntl is POSIX-only
+        yield
+        return
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_json_object(path: Path, data: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".json")
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        tmp_path.replace(path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            tmp_path.unlink()
+        raise
+
+
+class _NodeTagCache:
+    """Persist Ray's mutable, per-node tags to a local JSON file.
+
+    SRC workspaces have no generic tag/label/metadata store, so tags Ray
+    writes after node creation (notably ``TAG_RAY_LAUNCH_CONFIG``, used to
+    detect out-of-date nodes) cannot be saved on the workspace itself. This
+    keeps them in ``~/.cache/src_ray_provider/node_tags/<cluster_name>.json``
+    instead, keyed by SRC workspace id, so they survive across separate
+    ``ray`` command invocations on the same machine/account. A sibling
+    ``.lock`` file provides cross-process safety for concurrent readers and
+    writers (e.g. ``ray up`` and the autoscaler monitor) on that machine.
+    """
+
+    def __init__(self, cluster_name: str, cache_dir: Path) -> None:
+        self._path = cache_dir / f"{sanitize_name_component(cluster_name)}.json"
+        self._lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        self._process_lock = threading.RLock()
+
+    def get(self, node_id: str) -> dict[str, str]:
+        with self._process_lock, _locked_cache_file(self._lock_path):
+            cache = _read_json_object(self._path)
+        tags = cache.get(node_id)
+        return dict(tags) if isinstance(tags, dict) else {}
+
+    def update(self, node_id: str, tags: Mapping[str, str]) -> None:
+        if not tags:
+            return
+        with self._process_lock, _locked_cache_file(self._lock_path):
+            cache = _read_json_object(self._path)
+            node_tags = cache.get(node_id)
+            node_tags = dict(node_tags) if isinstance(node_tags, dict) else {}
+            node_tags.update(tags)
+            cache[node_id] = node_tags
+            _write_json_object(self._path, cache)
+
+    def discard(self, node_ids: list[str]) -> None:
+        if not node_ids:
+            return
+        with self._process_lock, _locked_cache_file(self._lock_path):
+            cache = _read_json_object(self._path)
+            changed = False
+            for node_id in node_ids:
+                if cache.pop(node_id, None) is not None:
+                    changed = True
+            if changed:
+                _write_json_object(self._path, cache)
 
 
 def sanitize_name_component(value: str) -> str:
@@ -176,6 +293,7 @@ class ResearchCloudNodeProvider(NodeProvider):
 
         self._workspaces: dict[str, dict[str, Any]] = {}
         self._workspaces_lock = threading.RLock()
+        self._node_tag_cache = _NodeTagCache(cluster_name, NODE_TAG_CACHE_DIR)
 
     @staticmethod
     def _config_value(
@@ -262,6 +380,11 @@ class ResearchCloudNodeProvider(NodeProvider):
         workspace is submitted sequentially to avoid racing while resolving
         or creating the shared private network. API rejections are isolated
         to their workspace; other errors propagate.
+
+        ``tags`` (e.g. ``TAG_RAY_LAUNCH_CONFIG``, ``TAG_RAY_NODE_STATUS``)
+        are cached locally per created workspace id -- see ``_NodeTagCache``
+        -- since SRC has nowhere to store them and losing them would make
+        every node look permanently out-of-date to Ray.
         """
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise ValueError(f"node creation count must be a non-negative integer, got {count!r}")
@@ -285,7 +408,10 @@ class ResearchCloudNodeProvider(NodeProvider):
             )
 
         del node_config, resources, labels
-        return asyncio.run(self._create_nodes(node_type, count))
+        created = asyncio.run(self._create_nodes(node_type, count))
+        for workspace_id in created:
+            self._node_tag_cache.update(workspace_id, tags)
+        return created
 
     async def _create_nodes(self, node_type: str, count: int) -> Dict[str, Dict[str, Any]]:
         created: Dict[str, Dict[str, Any]] = {}
@@ -631,24 +757,34 @@ class ResearchCloudNodeProvider(NodeProvider):
         return is_workspace_terminal_status(self._workspace_status(workspace))
 
     def node_tags(self, node_id: str) -> Dict[str, str]:
-        """Return this node's static tags (node kind, user node type, cluster
-        name), derived from queryable workspace fields. Mutable Ray tags are
-        intentionally not persisted because they are not used for identity.
+        """Return this node's tags: identity tags (node kind, user node
+        type, cluster name) derived from queryable workspace fields, merged
+        with any mutable tags Ray has written via ``create_node``/
+        ``set_node_tags`` and cached locally (see ``_NodeTagCache``, since
+        SRC has nowhere to store them). Derived identity tags always win on
+        key conflicts, since they reflect the workspace's actual state.
         """
         workspace = self._get_cached_or_fetch(node_id)
         if workspace is None:
             return {}
-        return self._node_tags_for_workspace(workspace)
+        tags = self._node_tag_cache.get(node_id)
+        tags.update(self._node_tags_for_workspace(workspace))
+        return tags
 
     def set_node_tags(self, node_id: str, tags: Dict[str, str]) -> None:
-        """Accept Ray's mutable tag writes without persisting unsupported data.
+        """Persist Ray's mutable tag writes to the local tag cache.
 
-        Identity tags are derived from workspace fields and cannot be changed
-        independently. Ray's mutable tags are informational and are not read
-        back by this provider, so retaining them in the SRC workspace would
-        add storage without affecting autoscaler behavior.
+        Identity tags (node kind, user node type, cluster name) are derived
+        from workspace fields and cannot be changed independently, so writes
+        to those keys are cached but ultimately ignored by ``node_tags``
+        (which always prefers the derived value). Everything else -- e.g.
+        ``TAG_RAY_LAUNCH_CONFIG``, ``TAG_RAY_RUNTIME_CONFIG``,
+        ``TAG_RAY_NODE_STATUS`` -- has no home in the SRC workspace itself,
+        so it is kept in ``_NodeTagCache`` instead; see the module docstring
+        for why this matters (losing ``TAG_RAY_LAUNCH_CONFIG`` makes every
+        node look permanently out-of-date to Ray).
         """
-        del node_id, tags
+        self._node_tag_cache.update(node_id, tags)
 
     async def _terminate_nodes(self, node_ids: list[str]) -> None:
         async with ResearchCloudClient.from_env() as client:
@@ -661,13 +797,18 @@ class ResearchCloudNodeProvider(NodeProvider):
                     logger.info("SRC workspace %r was already absent during termination", node_id)
                 with self._workspaces_lock:
                     self._workspaces.pop(node_id, None)
+        self._node_tag_cache.discard(node_ids)
 
     def terminate_node(self, node_id: str) -> None:
-        """Delete one SRC workspace and forget its cached representation."""
+        """Delete one SRC workspace and forget its cached representation
+        (including its locally cached mutable tags; see ``_NodeTagCache``).
+        """
         asyncio.run(self._terminate_nodes([node_id]))
 
     def terminate_nodes(self, node_ids: list[str]) -> None:
-        """Delete a batch of SRC workspaces using one client session."""
+        """Delete a batch of SRC workspaces using one client session, and
+        forget their locally cached mutable tags (see ``_NodeTagCache``).
+        """
         asyncio.run(self._terminate_nodes(node_ids))
 
     @staticmethod
