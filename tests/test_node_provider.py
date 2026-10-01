@@ -56,6 +56,7 @@ def test_provider_configuration_uses_defaults():
         "size_flavour_name": "2 Core - 8 GB",
         "use_private_network": True,
         "network_name_hint": None,
+        "optional_parameters": {"ray_public_key": "", "ray_do_setup": "false"},
     }
     assert provider._workspace_creation_options("worker") == {
         "catalog_item_name": DEFAULT_WORKER_CATALOG_ITEM_NAME,
@@ -64,6 +65,7 @@ def test_provider_configuration_uses_defaults():
         "size_flavour_name": "4 Core - 16 GB",
         "use_private_network": True,
         "network_name_hint": None,
+        "optional_parameters": {"ray_public_key": "", "ray_do_setup": "false"},
     }
 
 
@@ -88,6 +90,7 @@ def test_provider_configuration_allows_overrides():
         "size_flavour_name": "8 Core - 32 GB",
         "use_private_network": True,
         "network_name_hint": "ray-private",
+        "optional_parameters": {"ray_public_key": "", "ray_do_setup": "false"},
     }
 
 
