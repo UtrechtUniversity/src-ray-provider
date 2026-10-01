@@ -100,12 +100,7 @@ DEFAULT_OS_FLAVOUR_NAME = "Ubuntu 24.04"
 DEFAULT_WORKSPACE_CREATION_TIMEOUT = 2400
 WORKSPACE_CREATION_POLL_INTERVAL = 5
 
-HEAD_SETUP_COMMANDS = [
-    (
-        'VIRTUAL_ENV=ray_venv uv pip install --upgrade '
-        '"src-ray-provider @ git+https://github.com/UtrechtUniversity/src-ray-provider.git"'
-    )
-]
+HEAD_SETUP_COMMANDS = [] # default head setup commands, currenly empty
 
 HTTP_NOT_FOUND = 404
 
@@ -283,7 +278,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             provider_config, "os_flavour_name", default=DEFAULT_OS_FLAVOUR_NAME
         )
         self.network_name_hint = self._config_value(provider_config, "network_name_hint", optional=True)
-        self.ray_public_key = self._config_value(provider_config, "ray_public_key", optional=True)
+        self.ray_public_key = self._config_value(provider_config, "ray_public_key", optional=False)
         self.workspace_creation_timeout = self._timeout_value(
             provider_config, "workspace_creation_timeout", DEFAULT_WORKSPACE_CREATION_TIMEOUT
         )
