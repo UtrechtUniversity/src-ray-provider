@@ -247,7 +247,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         if not isinstance(head_setup_commands, list):
             raise ValueError("cluster config 'head_setup_commands' must be a list")
         for cmd in HEAD_SETUP_COMMANDS:
-            head_setup_commands.append(cmd) if cmd not in head_setup_commands
+            head_setup_commands.append(cmd) if cmd not in head_setup_commands else None
 
         auth_config = cluster_config.get("auth")
         if "ray_public_key" not in provider_config and isinstance(auth_config, Mapping):
