@@ -77,7 +77,7 @@ try:
 except ImportError:  # pragma: no cover - fcntl is POSIX-only; Ray targets POSIX hosts
     fcntl = None
 
-from ray import version as ray_version
+from ray import _version as ray_version
 from ray.autoscaler.node_provider import NodeProvider
 from ray.autoscaler.tags import (
     NODE_KIND_HEAD,
