@@ -1,0 +1,46 @@
+# Example Ray cluster configuration for the SRC node provider.
+# The provider injects an installation command for the autoscaler package
+# into the head's setup commands automatically.
+cluster_name: src-ray-example
+
+provider:
+  type: src_ray_provider.node_provider.ResearchCloudNodeProvider
+  co_name: Example CO
+  wallet_name: Example Wallet
+
+auth:
+  ssh_user: ray
+  # ssh_private_key: ~/.ssh/...
+  # ssh_public_key: ~/.ssh/...
+
+# TESTING ONLY: replace the placeholder before launching. The token is written
+# to a head-only file with owner-only permissions, then supplied to `ray start`
+# so the autoscaler monitor inherits it. This exposes the token in this
+# cluster config and potentially command logs; do not use for shared/production
+# clusters. Remove these commands after testing.
+head_setup_commands:
+  - "umask 077 && printf '%s' 'REPLACE_WITH_SRC_TOKEN' > ~/.researchcloud-token"
+
+head_start_ray_commands:
+  - ray stop
+  - >-
+    RESEARCH_CLOUD_TOKEN="$(cat ~/.researchcloud-token)" ray start --head
+    --port=6379 --dashboard-host=0.0.0.0
+    --autoscaling-config=~/ray_bootstrap_config.yaml
+
+head_node_type: head
+available_node_types:
+  head:
+    min_workers: 0
+    max_workers: 0
+    resources: {"CPU": 2}
+    node_config:
+      size_flavour_name: 2 Core - 8 GB
+  worker:
+    min_workers: 1
+    max_workers: 4
+    resources: {"CPU": 1}
+    node_config:
+      num_cpu: 1
+
+idle_timeout_minutes: 10

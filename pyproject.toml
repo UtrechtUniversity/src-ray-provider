@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "src-ray-provider"
+version = "0.1.0"
+description = "Ray autoscaler node provider for SURF ResearchCloud"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "ray>=2.9,<3",
+  "researchcloud-api @ git+https://github.com/UtrechtUniversity/src-api-sdk.git",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

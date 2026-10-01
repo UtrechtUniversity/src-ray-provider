@@ -1,0 +1,606 @@
+"""SURF ResearchCloud node provider for Ray.
+
+This slice discovers workspaces as Ray nodes and derives their static,
+creation-time tags (node kind, user node type, cluster name) entirely from
+queryable workspace fields — no tag data is persisted in the workspace
+itself. Node creation and SSH address lookup are supported; mutable tag
+storage is not needed, and termination delegates to the workspace delete API.
+
+Static tag derivation works as follows, trading a small amount of config
+duplication for avoiding any persisted/free-text tag storage:
+
+- ``TAG_RAY_USER_NODE_TYPE`` is recovered by reverse-mapping a workspace's
+  ``(catalog item name, size flavour name)`` pair back to the Ray node type
+  that was configured to use that pair (``provider.config.node_types``).
+  This requires each node type to resolve to a distinct pair; this is
+  validated at startup. SRC catalog items are role-specific (distinct head
+  vs. worker offerings), so the default catalog item name also depends on
+  whether a node type is the configured ``head_node_type`` (see
+  ``DEFAULT_HEAD_CATALOG_ITEM_NAME`` / ``DEFAULT_WORKER_CATALOG_ITEM_NAME``);
+  it can still be overridden per node type via
+  ``available_node_types.<type>.node_config.catalog_item_name``.
+- ``TAG_RAY_NODE_KIND`` is a pure function of the derived node type versus
+  ``provider.config.head_node_type`` — a value Ray does not pass to
+  ``NodeProvider.__init__`` (only the ``provider:`` section and
+  ``cluster_name`` are passed). Rather than requiring cluster.yaml authors
+  to duplicate it manually, ``bootstrap_config`` (a hook Ray calls once
+  with the *full* cluster config, before constructing the provider; see
+  ``ray.autoscaler.node_provider.NodeProvider.bootstrap_config`` and
+  ``ray.autoscaler._private.commands._bootstrap_config``) copies
+  cluster.yaml's top-level ``head_node_type`` into ``provider.head_node_type``
+  automatically. Likewise, ``provider.node_types`` is auto-derived from
+  each node type's ``available_node_types.<type>.node_config`` — the same
+  place Ray's own providers read provider-specific per-node-type settings
+  from (e.g. the AWS provider's ``create_node(node_config, ...)``) — so no
+  parallel config block needs to be hand-written either. Both remain
+  overridable by setting them explicitly under ``provider:``.
+- ``TAG_RAY_CLUSTER_NAME`` is never parsed back out of anything: since a
+  ``NodeProvider`` only ever manages nodes within its own ``cluster_name``
+  namespace, it is simply ``self.cluster_name`` for any workspace that
+  belongs to this cluster. Cluster membership is determined by a naming
+  convention applied when a workspace is created: its ``name`` is prefixed
+  with ``ray-{cluster_name}-`` (sanitized to fit SRC's naming rules).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import threading
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Mapping
+
+from ray.autoscaler.node_provider import NodeProvider
+from ray.autoscaler.tags import (
+    NODE_KIND_HEAD,
+    NODE_KIND_WORKER,
+    TAG_RAY_CLUSTER_NAME,
+    TAG_RAY_NODE_KIND,
+    TAG_RAY_USER_NODE_TYPE,
+)
+
+from researchcloud.client import ResearchCloudClient
+from researchcloud.config import DEFAULT_CLOUD_NAME
+from researchcloud.errors import ApiError
+from researchcloud.services import is_workspace_terminal_status
+from researchcloud.utils.flavours import match_size_flavour, validate_size_flavour_selection
+
+
+DEFAULT_HEAD_CATALOG_ITEM_NAME = "Ray Head Node"
+DEFAULT_WORKER_CATALOG_ITEM_NAME = "Ray Worker"
+DEFAULT_OS_FLAVOUR_NAME = "Ubuntu 24.04"
+PROVIDER_INSTALL_COMMAND = (
+    'python3 -m pip install --upgrade '
+    '"src-ray-provider @ git+https://github.com/UtrechtUniversity/src-ray-provider.git"'
+)
+
+HTTP_NOT_FOUND = 404
+
+_NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_\-]+")
+_WORKSPACE_NAME_MAX_LENGTH = 100
+logger = logging.getLogger(__name__)
+
+
+def sanitize_name_component(value: str) -> str:
+    """Sanitize a string so it is safe to embed in an SRC workspace ``name``.
+
+    SRC workspace names must match ``^[a-zA-Z0-9_\\-\\s]+$`` and are capped
+    at 100 characters. This collapses any run of disallowed characters to a
+    single dash and strips leading/trailing dashes.
+    """
+    sanitized = _NAME_SANITIZE_RE.sub("-", value.strip()).strip("-")
+    if not sanitized:
+        raise ValueError(f"cannot derive a valid SRC workspace name component from {value!r}")
+    return sanitized
+
+
+class ResearchCloudNodeProvider(NodeProvider):
+    """Discover SRC Compute workspaces as Ray nodes.
+
+    Provider settings use ``co_name`` and ``wallet_name``; cloud, OS flavour,
+    and network name hint have defaults or are optional. ``head_node_type``
+    and ``node_types`` are required at construction time but are normally
+    auto-populated by ``bootstrap_config`` rather than hand-written — see
+    that method and the module docstring for how and why. Workspaces are
+    configured to use the private network for node-to-node SSH.
+    """
+
+    @staticmethod
+    def bootstrap_config(cluster_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill in ``provider.head_node_type``/``provider.node_types`` from
+        cluster.yaml's top-level ``head_node_type``/``available_node_types``
+        so cluster.yaml authors don't have to duplicate them under
+        ``provider:`` by hand. Existing ``provider:`` values are left alone,
+        so an explicit override still takes precedence.
+        """
+        provider_config = cluster_config.setdefault("provider", {})
+        provider_config.setdefault("head_node_type", cluster_config.get("head_node_type"))
+
+        head_setup_commands = cluster_config.setdefault("head_setup_commands", [])
+        if not isinstance(head_setup_commands, list):
+            raise ValueError("cluster config 'head_setup_commands' must be a list")
+        if PROVIDER_INSTALL_COMMAND not in head_setup_commands:
+            head_setup_commands.append(PROVIDER_INSTALL_COMMAND)
+
+        auth_config = cluster_config.get("auth")
+        if "ray_public_key" not in provider_config and isinstance(auth_config, Mapping):
+            public_key = auth_config.get("ssh_public_key")
+            if isinstance(public_key, str) and public_key.strip():
+                public_key_path = Path(public_key).expanduser()
+                provider_config["ray_public_key"] = (
+                    public_key_path.read_text(encoding="utf-8").strip()
+                    if public_key_path.is_file()
+                    else public_key.strip()
+                )
+
+        if "node_types" not in provider_config:
+            derived_node_types: dict[str, dict[str, Any]] = {}
+            for node_type, node_type_config in cluster_config.get("available_node_types", {}).items():
+                node_config = node_type_config.get("node_config", {}) if isinstance(node_type_config, Mapping) else {}
+                derived_node_type: dict[str, Any] = {
+                    key: node_config[key]
+                    for key in ("size_flavour_name", "num_cpu", "num_gpu", "gpu_type", "catalog_item_name")
+                    if key in node_config
+                }
+                derived_node_types[node_type] = derived_node_type
+            provider_config["node_types"] = derived_node_types
+
+        return cluster_config
+
+    def __init__(self, provider_config: Dict[str, Any], cluster_name: str) -> None:
+        super().__init__(provider_config, cluster_name)
+        self.co_name = self._config_value(provider_config, "co_name")
+        self.wallet_name = self._config_value(provider_config, "wallet_name")
+        self.cloud_name = self._config_value(provider_config, "cloud_name", default=DEFAULT_CLOUD_NAME)
+        self.os_flavour_name = self._config_value(
+            provider_config, "os_flavour_name", default=DEFAULT_OS_FLAVOUR_NAME
+        )
+        self.network_name_hint = self._config_value(provider_config, "network_name_hint", optional=True)
+        self.ray_public_key = self._config_value(provider_config, "ray_public_key", optional=True)
+
+        self.head_node_type = self._config_value(provider_config, "head_node_type")
+        self._node_type_configs, self._node_type_lookup = self._parse_node_types(provider_config)
+        if self.head_node_type not in self._node_type_configs:
+            raise ValueError(
+                f"provider config 'head_node_type' {self.head_node_type!r} must be a key in 'node_types'"
+            )
+        self._cluster_prefix = f"ray-{sanitize_name_component(cluster_name)}-"
+
+        self._workspaces: dict[str, dict[str, Any]] = {}
+        self._workspaces_lock = threading.RLock()
+
+    @staticmethod
+    def _config_value(
+        provider_config: Mapping[str, Any],
+        key: str,
+        default: str | None = None,
+        *,
+        optional: bool = False,
+    ) -> str | None:
+        """Read and validate a string provider-config value.
+
+        With no ``default``, ``key`` is required unless ``optional=True``
+        (in which case a missing value returns ``None``). Whenever a value
+        is present (explicit or via ``default``), it must be a non-empty
+        string.
+        """
+        value = provider_config.get(key, default)
+        if value is None:
+            if optional:
+                return None
+            raise ValueError(f"provider config must include a non-empty {key!r}")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"provider config {key!r} must be a non-empty string")
+        return value.strip()
+
+    def _workspace_creation_options(self, node_type: str) -> dict[str, Any]:
+        node_type_config = self._node_type_configs[node_type]
+        options = {
+            "catalog_item_name": node_type_config["catalog_item_name"],
+            "cloud_name": self.cloud_name,
+            "os_flavour_name": self.os_flavour_name,
+            "size_flavour_name": node_type_config["size_flavour_name"],
+            "use_private_network": True,
+            "network_name_hint": self.network_name_hint,
+        }
+        if self.ray_public_key is not None:
+            options["optional_parameters"] = {
+                "ray_public_key": self.ray_public_key,
+                "ray_do_setup": "false",
+            }
+        return options
+
+    def create_node_with_resources_and_labels(
+        self,
+        node_config: Dict[str, Any],
+        tags: Dict[str, str],
+        count: int,
+        resources: Dict[str, float],
+        labels: Dict[str, str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Create up to ``count`` SRC workspaces for one Ray node type.
+
+        SRC has no workspace-creation fields for Ray's scheduling resources
+        or labels, so those hints are intentionally not persisted. Each
+        workspace is submitted sequentially to avoid racing while resolving
+        or creating the shared private network. API rejections are isolated
+        to their workspace; other errors propagate.
+        """
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(f"node creation count must be a non-negative integer, got {count!r}")
+        if count == 0:
+            return {}
+
+        node_type = tags.get(TAG_RAY_USER_NODE_TYPE)
+        if not isinstance(node_type, str) or node_type not in self._node_type_configs:
+            raise ValueError(f"node creation tags must include a configured {TAG_RAY_USER_NODE_TYPE!r}")
+        expected_tags = {
+            TAG_RAY_CLUSTER_NAME: self.cluster_name,
+            TAG_RAY_NODE_KIND: self._kind_for_node_type(node_type),
+        }
+        for tag, expected_value in expected_tags.items():
+            if tags.get(tag) != expected_value:
+                raise ValueError(f"node creation tag {tag!r} must be {expected_value!r}, got {tags.get(tag)!r}")
+
+        del node_config, resources, labels
+        return asyncio.run(self._create_nodes(node_type, count))
+
+    async def _create_nodes(self, node_type: str, count: int) -> Dict[str, Dict[str, Any]]:
+        created: Dict[str, Dict[str, Any]] = {}
+        async with ResearchCloudClient.from_env() as client:
+            for _ in range(count):
+                workspace_name = self._workspace_name_for(node_type)
+                plan = await client.workspaces.build_create_payload_from_names(
+                    co_name=self.co_name,
+                    wallet_name=self.wallet_name,
+                    workspace_name=workspace_name,
+                    **self._workspace_creation_options(node_type),
+                )
+                try:
+                    workspace = await client.workspaces.create(plan.payload)
+                except ApiError as exc:
+                    logger.error(
+                        "Failed to create SRC workspace %r for Ray node type %r (HTTP %s): %s",
+                        workspace_name,
+                        node_type,
+                        exc.status_code,
+                        exc.body,
+                    )
+                    continue
+
+                workspace_id = self._workspace_id(workspace)
+                created[workspace_id] = workspace
+        return created
+
+    def _default_catalog_item_name(self, node_type: str) -> str:
+        return DEFAULT_HEAD_CATALOG_ITEM_NAME if node_type == self.head_node_type else DEFAULT_WORKER_CATALOG_ITEM_NAME
+
+    def _node_type_sizing_spec(self, node_type: str, node_type_config: Mapping[str, Any]) -> dict[str, Any]:
+        """Extract and validate a node type's sizing spec: an exact
+        ``size_flavour_name``, or ``num_cpu``/``num_gpu`` (optionally with
+        ``gpu_type``) to be resolved against the SRC catalog later. Exactly
+        one sizing strategy must be given.
+        """
+        size_flavour_name = node_type_config.get("size_flavour_name")
+        num_cpu = node_type_config.get("num_cpu")
+        num_gpu = node_type_config.get("num_gpu")
+        gpu_type = node_type_config.get("gpu_type")
+        try:
+            validate_size_flavour_selection(size_flavour_name, num_cpu, num_gpu)
+        except ValueError as exc:
+            raise ValueError(f"provider config node_types[{node_type!r}]: {exc}") from exc
+        if size_flavour_name is not None and not (
+            isinstance(size_flavour_name, str) and size_flavour_name.strip()
+        ):
+            raise ValueError(
+                f"provider config node_types[{node_type!r}].size_flavour_name must be a non-empty string"
+            )
+        return {
+            "size_flavour_name": size_flavour_name.strip() if size_flavour_name else None,
+            "num_cpu": num_cpu,
+            "num_gpu": num_gpu,
+            "gpu_type": gpu_type,
+        }
+
+    async def _resolve_size_flavour_names(self, unresolved: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
+        """Resolve ``num_cpu``/``num_gpu`` sizing specs to actual SRC size
+        flavour names, by matching each node type's catalog item + offering
+        against the catalog (see ``WorkspacesService.build_create_payload_from_names``,
+        which does the equivalent resolution at workspace-creation time).
+        """
+        resolved: dict[str, str] = {}
+        async with ResearchCloudClient.from_env() as client:
+            co = await client.resolve_co(self.co_name)
+            wallet = await client.resolve_wallet(self.wallet_name)
+            products = wallet["budgets"][0]["products"]
+
+            catalog_items: dict[str, dict[str, Any]] = {}
+            for node_type, spec in unresolved.items():
+                catalog_item_name = spec["catalog_item_name"]
+                catalog_item = catalog_items.get(catalog_item_name)
+                if catalog_item is None:
+                    catalog_item = await client.resolve_catalog_item(catalog_item_name, co["id"], products)
+                    catalog_items[catalog_item_name] = catalog_item
+
+                offering, _, _ = await client.resolve_offering_and_flavours(
+                    catalog_item, co["id"], products, self.cloud_name, self.os_flavour_name, None
+                )
+                size_flavour = match_size_flavour(
+                    offering.get("flavours", []),
+                    num_cpu=spec["num_cpu"],
+                    num_gpu=spec["num_gpu"],
+                    gpu_type=spec["gpu_type"],
+                )
+                resolved[node_type] = size_flavour["name"]
+        return resolved
+
+    def _parse_node_types(
+        self, provider_config: Mapping[str, Any]
+    ) -> tuple[dict[str, dict[str, str]], dict[tuple[str, str], str]]:
+        """Build the node-type reverse-mapping from ``provider.config.node_types``.
+
+        For each node type, resolves its catalog item (defaulting by role;
+        see ``_default_catalog_item_name``) and size flavour name (resolving
+        ``num_cpu``/``num_gpu`` sizing specs against the SRC catalog, if
+        used), then indexes node types by that ``(catalog item, size
+        flavour)`` pair — see the module docstring for why and how this
+        reverse-mapping is used. Raises if two node types resolve to the
+        same pair, since the mapping would then be ambiguous.
+        """
+        raw = provider_config.get("node_types")
+        if not isinstance(raw, Mapping) or not raw:
+            raise ValueError(
+                "provider config must include a non-empty 'node_types' mapping that mirrors "
+                "cluster.yaml's available_node_types, giving each node type's SRC sizing "
+                "(size_flavour_name or num_cpu/num_gpu, optional catalog_item_name) so nodes "
+                "can be matched back to their Ray node type without persisted tag storage"
+            )
+
+        specs: dict[str, dict[str, Any]] = {}
+        for node_type, node_type_config in raw.items():
+            if not isinstance(node_type_config, Mapping):
+                raise ValueError(f"provider config node_types[{node_type!r}] must be a mapping")
+
+            catalog_item_name = node_type_config.get(
+                "catalog_item_name", self._default_catalog_item_name(node_type)
+            )
+            if not isinstance(catalog_item_name, str) or not catalog_item_name.strip():
+                raise ValueError(
+                    f"provider config node_types[{node_type!r}].catalog_item_name must be a non-empty string"
+                )
+
+            sizing = self._node_type_sizing_spec(node_type, node_type_config)
+            specs[node_type] = {"catalog_item_name": catalog_item_name.strip(), **sizing}
+
+        unresolved = {
+            node_type: spec for node_type, spec in specs.items() if spec["size_flavour_name"] is None
+        }
+        if unresolved:
+            resolved_names = asyncio.run(self._resolve_size_flavour_names(unresolved))
+            for node_type, size_flavour_name in resolved_names.items():
+                specs[node_type]["size_flavour_name"] = size_flavour_name
+
+        configs: dict[str, dict[str, str]] = {}
+        lookup: dict[tuple[str, str], str] = {}
+        for node_type, spec in specs.items():
+            catalog_item_name = spec["catalog_item_name"]
+            size_flavour_name = spec["size_flavour_name"]
+            key = (catalog_item_name, size_flavour_name)
+            if key in lookup:
+                raise ValueError(
+                    f"node types {lookup[key]!r} and {node_type!r} both resolve to the same SRC "
+                    f"catalog item + size flavour {key!r}; node types must be distinguishable to "
+                    "derive the Ray user node type tag without persisted tag storage"
+                )
+            lookup[key] = node_type
+            configs[node_type] = {"catalog_item_name": catalog_item_name, "size_flavour_name": size_flavour_name}
+        return configs, lookup
+
+    def _node_type_for_workspace(self, workspace: Mapping[str, Any]) -> str | None:
+        catalog_item_name = workspace.get("meta", {}).get("application_name")
+        size_flavour_name = workspace.get("resource_meta", {}).get("flavor_name")
+        if not catalog_item_name or not size_flavour_name:
+            return None
+        return self._node_type_lookup.get((catalog_item_name, size_flavour_name))
+
+    def _kind_for_node_type(self, node_type: str) -> str:
+        return NODE_KIND_HEAD if node_type == self.head_node_type else NODE_KIND_WORKER
+
+    def _node_tags_for_workspace(self, workspace: Mapping[str, Any]) -> dict[str, str]:
+        """Derive this workspace's static Ray tags from queryable fields only.
+
+        The cluster name tag is always ``self.cluster_name`` once a
+        workspace has passed :meth:`_belongs_to_cluster`'s name-prefix
+        check; node type and kind are only included if the workspace's
+        catalog item + size flavour resolve to a configured node type
+        (e.g. they won't for a workspace whose flavour was changed
+        out-of-band after creation).
+        """
+        tags = {TAG_RAY_CLUSTER_NAME: self.cluster_name}
+        node_type = self._node_type_for_workspace(workspace)
+        if node_type is not None:
+            tags[TAG_RAY_USER_NODE_TYPE] = node_type
+            tags[TAG_RAY_NODE_KIND] = self._kind_for_node_type(node_type)
+        return tags
+
+    def _belongs_to_cluster(self, workspace: Mapping[str, Any]) -> bool:
+        """Return whether a workspace's name marks it as managed by this cluster.
+
+        A ``NodeProvider`` only ever operates within its own
+        ``cluster_name`` namespace, so this is a prefix check against the
+        naming convention applied at creation time (``_workspace_name_for``)
+        rather than an attempt to parse an arbitrary cluster name back out.
+        """
+        name = workspace.get("name")
+        return isinstance(name, str) and name.startswith(self._cluster_prefix)
+
+    def _workspace_name_for(self, node_type: str) -> str:
+        """Build the creation-time workspace name encoding cluster + node type.
+
+        Used by cluster-membership checks (``_belongs_to_cluster``) and,
+        eventually, node creation (section 4).
+        """
+        suffix = uuid.uuid4().hex[:8]
+        sanitized_node_type = sanitize_name_component(node_type)
+        base = f"{self._cluster_prefix}{sanitized_node_type}-"
+        max_base_length = _WORKSPACE_NAME_MAX_LENGTH - len(suffix)
+        if len(base) > max_base_length:
+            base = base[:max_base_length]
+        return f"{base}{suffix}"
+
+    @staticmethod
+    def _workspace_id(workspace: Mapping[str, Any]) -> str:
+        workspace_id = workspace.get("id")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            raise ValueError(f"SRC workspace response is missing a string id: {workspace!r}")
+        return workspace_id
+
+    @staticmethod
+    def _workspace_status(workspace: Mapping[str, Any]) -> str:
+        status = workspace.get("status")
+        if not isinstance(status, str) or not status:
+            raise ValueError(f"SRC workspace response is missing a string status: {workspace!r}")
+        return status
+
+    async def _list_workspaces(self) -> list[dict[str, Any]]:
+        async with ResearchCloudClient.from_env() as client:
+            co = await client.resolve_co(self.co_name)
+            # Node types can use distinct catalog items per role (head vs.
+            # worker), so no single catalog_item_name can be used to filter
+            # server-side; cluster membership is instead established by the
+            # workspace name prefix via _belongs_to_cluster().
+            return await client.workspaces.list(
+                co_id=co["id"],
+                catalog_item_name="",
+                application_type="Compute",
+            )
+
+    async def _get_workspace(self, workspace_id: str) -> dict[str, Any]:
+        async with ResearchCloudClient.from_env() as client:
+            return await client.workspaces.get(workspace_id)
+
+    def _fetch_workspace(self, workspace_id: str) -> dict[str, Any] | None:
+        """Fetch a single workspace, treating a 404 as "no longer exists" rather than an error."""
+        try:
+            return asyncio.run(self._get_workspace(workspace_id))
+        except ApiError as exc:
+            if exc.status_code == HTTP_NOT_FOUND:
+                return None
+            raise
+
+    def _get_cached_or_fetch(self, workspace_id: str) -> dict[str, Any] | None:
+        with self._workspaces_lock:
+            workspace = self._workspaces.get(workspace_id)
+        if workspace is not None:
+            return workspace
+
+        workspace = self._fetch_workspace(workspace_id)
+        if workspace is None:
+            return None
+        self._workspace_id(workspace)
+        self._workspace_status(workspace)
+        with self._workspaces_lock:
+            self._workspaces[workspace_id] = workspace
+        return workspace
+
+    def non_terminated_nodes(self, tag_filters: Dict[str, str]) -> List[str]:
+        workspaces = asyncio.run(self._list_workspaces())
+        current_workspaces: dict[str, dict[str, Any]] = {}
+        for workspace in workspaces:
+            workspace_id = self._workspace_id(workspace)
+            self._workspace_status(workspace)
+            current_workspaces[workspace_id] = workspace
+
+        with self._workspaces_lock:
+            self._workspaces = current_workspaces
+
+        matching_node_ids = []
+        for workspace_id, workspace in current_workspaces.items():
+            if is_workspace_terminal_status(self._workspace_status(workspace)):
+                continue
+            if not self._belongs_to_cluster(workspace):
+                continue
+            if tag_filters:
+                node_tags = self._node_tags_for_workspace(workspace)
+                if any(node_tags.get(key) != value for key, value in tag_filters.items()):
+                    continue
+            matching_node_ids.append(workspace_id)
+        return matching_node_ids
+
+    def is_running(self, node_id: str) -> bool:
+        workspace = self._get_cached_or_fetch(node_id)
+        if workspace is None:
+            return False
+        return self._workspace_status(workspace) == "running"
+
+    def is_terminated(self, node_id: str) -> bool:
+        workspace = self._get_cached_or_fetch(node_id)
+        if workspace is None:
+            return True
+        return is_workspace_terminal_status(self._workspace_status(workspace))
+
+    def node_tags(self, node_id: str) -> Dict[str, str]:
+        """Return this node's static tags (node kind, user node type, cluster
+        name), derived from queryable workspace fields. Mutable Ray tags are
+        intentionally not persisted because they are not used for identity.
+        """
+        workspace = self._get_cached_or_fetch(node_id)
+        if workspace is None:
+            return {}
+        return self._node_tags_for_workspace(workspace)
+
+    def set_node_tags(self, node_id: str, tags: Dict[str, str]) -> None:
+        """Accept Ray's mutable tag writes without persisting unsupported data.
+
+        Identity tags are derived from workspace fields and cannot be changed
+        independently. Ray's mutable tags are informational and are not read
+        back by this provider, so retaining them in the SRC workspace would
+        add storage without affecting autoscaler behavior.
+        """
+        del node_id, tags
+
+    async def _terminate_nodes(self, node_ids: list[str]) -> None:
+        async with ResearchCloudClient.from_env() as client:
+            for node_id in node_ids:
+                try:
+                    await client.workspaces.delete(node_id)
+                except ApiError as exc:
+                    if exc.status_code != HTTP_NOT_FOUND:
+                        raise
+                    logger.info("SRC workspace %r was already absent during termination", node_id)
+                with self._workspaces_lock:
+                    self._workspaces.pop(node_id, None)
+
+    def terminate_node(self, node_id: str) -> None:
+        """Delete one SRC workspace and forget its cached representation."""
+        asyncio.run(self._terminate_nodes([node_id]))
+
+    def terminate_nodes(self, node_ids: list[str]) -> None:
+        """Delete a batch of SRC workspaces using one client session."""
+        asyncio.run(self._terminate_nodes(node_ids))
+
+    @staticmethod
+    def _workspace_ip(workspace: Mapping[str, Any], *, private: bool) -> str:
+        """Return a workspace's public or private address when assigned."""
+        resource_meta = workspace.get("resource_meta")
+        if not isinstance(resource_meta, Mapping):
+            return ""
+        field = "local_ip" if private else "ip"
+        address = resource_meta.get(field)
+        return address if isinstance(address, str) else ""
+
+    def internal_ip(self, node_id: str) -> str:
+        """Return the private address used for head-to-worker SSH."""
+        workspace = self._get_cached_or_fetch(node_id)
+        if workspace is None:
+            return ""
+        return self._workspace_ip(workspace, private=True)
+
+    def external_ip(self, node_id: str) -> str:
+        """Return the public address used by Ray's driver for initial SSH."""
+        workspace = self._get_cached_or_fetch(node_id)
+        if workspace is None:
+            return ""
+        return self._workspace_ip(workspace, private=False)
