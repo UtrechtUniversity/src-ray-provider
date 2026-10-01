@@ -431,7 +431,13 @@ def _workspace(
     if catalog_item_name is not None:
         workspace["meta"]["application_name"] = catalog_item_name
     if flavor_name is not None:
-        workspace["resource_meta"]["flavor_name"] = flavor_name
+        # Mirrors the real SRC API shape: the catalog size flavour's
+        # display name is listed in meta.flavours (category "size"), not
+        # resource_meta.flavor_name (an unrelated infrastructure-level
+        # slug, e.g. "hpc-1core-8gb-20gb", that node type matching must
+        # not rely on).
+        workspace["meta"]["flavours"] = [{"category": "size", "name": flavor_name}]
+        workspace["resource_meta"]["flavor_name"] = "infra-slug-unrelated-to-catalog-name"
     if ip is not None:
         workspace["resource_meta"]["ip"] = ip
     if local_ip is not None:

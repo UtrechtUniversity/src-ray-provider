@@ -464,9 +464,32 @@ class ResearchCloudNodeProvider(NodeProvider):
             configs[node_type] = {"catalog_item_name": catalog_item_name, "size_flavour_name": size_flavour_name}
         return configs, lookup
 
+    @staticmethod
+    def _size_flavour_name_for_workspace(workspace: Mapping[str, Any]) -> str | None:
+        """Return the catalog size flavour's ``name`` for a workspace.
+
+        ``resource_meta.flavor_name`` is an infrastructure-level slug (e.g.
+        ``"hpc-1core-8gb-20gb"``) that does not match the catalog flavour
+        ``name`` (e.g. ``"1 Core - 8 GB RAM"``) node types are configured
+        with. The catalog flavour actually applied to the workspace is
+        listed in ``meta.flavours`` instead (the same objects
+        ``resolve_offering_and_flavours``/``match_size_flavour`` match
+        against at creation time), so the size flavour's ``name`` must be
+        read from there.
+        """
+        flavours = workspace.get("meta", {}).get("flavours")
+        if not isinstance(flavours, list):
+            return None
+        for flavour in flavours:
+            if isinstance(flavour, Mapping) and flavour.get("category") == "size":
+                name = flavour.get("name")
+                if isinstance(name, str) and name:
+                    return name
+        return None
+
     def _node_type_for_workspace(self, workspace: Mapping[str, Any]) -> str | None:
         catalog_item_name = workspace.get("meta", {}).get("application_name")
-        size_flavour_name = workspace.get("resource_meta", {}).get("flavor_name")
+        size_flavour_name = self._size_flavour_name_for_workspace(workspace)
         if not catalog_item_name or not size_flavour_name:
             return None
         return self._node_type_lookup.get((catalog_item_name, size_flavour_name))
