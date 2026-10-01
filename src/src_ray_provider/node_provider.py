@@ -223,11 +223,11 @@ class ResearchCloudNodeProvider(NodeProvider):
             "use_private_network": True,
             "network_name_hint": self.network_name_hint,
         }
-        if self.ray_public_key is not None:
-            options["optional_parameters"] = {
-                "ray_public_key": self.ray_public_key,
-                "ray_do_setup": "false",
-            }
+
+        options["optional_parameters"] = {
+            "ray_public_key": self.ray_public_key or "",
+            "ray_do_setup": "false",
+        }
         return options
 
     def create_node(
