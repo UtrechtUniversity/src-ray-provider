@@ -294,8 +294,8 @@ class ResearchCloudNodeProvider(NodeProvider):
             generated_private_key, generated_public_key = ResearchCloudNodeProvider._ensure_generated_keypair(
                 cluster_config.get("cluster_name")
             )
-            auth_config["ssh_public_key"] = str(generated_public_key)
-            auth_config["ssh_private_key"] = str(generated_private_key)
+            auth_config["ssh_public_key"] = str(generated_public_key).read_text(encoding="utf-8").strip()
+            auth_config["ssh_private_key"] = str(generated_private_key).read_text(encoding="utf-8").strip()
             public_key = auth_config["ssh_public_key"]
 
         if "ray_public_key" not in provider_config:
