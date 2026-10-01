@@ -54,6 +54,16 @@ running a given Ray command: a laptop running ``ray up`` and the autoscaler
 monitor running on the head node each keep their own cache file, so this
 only fixes repeat invocations from the *same* machine (which is the normal
 case for both ``ray up`` and the head-resident autoscaler monitor).
+
+SSH access for both the head and worker nodes relies on ``auth.ssh_public_key``
+/``auth.ssh_private_key`` in cluster.yaml, which ``bootstrap_config`` requires
+to be set together (or left unset together) -- see its docstring for why only
+setting one silently breaks head-to-worker SSH. When both are left unset,
+nothing in Ray generates credentials for the ``external`` provider type on
+its own (unlike its AWS/vSphere providers), so ``bootstrap_config`` generates
+and caches its own ed25519 keypair per cluster name instead (see
+``_ensure_generated_keypair``), under
+``~/.cache/src_ray_provider/ssh_keys/<cluster_name>/``.
 """
 
 from __future__ import annotations
@@ -71,6 +81,9 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 try:
     import fcntl
@@ -109,6 +122,7 @@ _WORKSPACE_NAME_MAX_LENGTH = 100
 logger = logging.getLogger(__name__)
 
 NODE_TAG_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "node_tags"
+SSH_KEY_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "ssh_keys"
 
 
 @contextlib.contextmanager
@@ -244,16 +258,53 @@ class ResearchCloudNodeProvider(NodeProvider):
         for cmd in HEAD_SETUP_COMMANDS:
             head_setup_commands.append(cmd) if cmd not in head_setup_commands else None
 
-        auth_config = cluster_config.get("auth")
-        if "ray_public_key" not in provider_config and isinstance(auth_config, Mapping):
-            public_key = auth_config.get("ssh_public_key")
-            if isinstance(public_key, str) and public_key.strip():
-                public_key_path = Path(public_key).expanduser()
-                provider_config["ray_public_key"] = (
-                    public_key_path.read_text(encoding="utf-8").strip()
-                    if public_key_path.is_file()
-                    else public_key.strip()
-                )
+        auth_config = cluster_config.setdefault("auth", {})
+        if not isinstance(auth_config, dict):
+            raise ValueError("cluster config 'auth' must be a mapping")
+
+        public_key = auth_config.get("ssh_public_key")
+        private_key = auth_config.get("ssh_private_key")
+        has_public_key = isinstance(public_key, str) and bool(public_key.strip())
+        has_private_key = isinstance(private_key, str) and bool(private_key.strip())
+        if has_public_key != has_private_key:
+            # Ray only copies auth.ssh_private_key onto the head node (as
+            # ~/ray_bootstrap_key.pem, see ray.autoscaler._private.commands
+            # ._set_up_config_for_head_node) when it is explicit, and this
+            # provider can only turn a public key into the SRC catalog
+            # item's ray_public_key parameter (below) if one is given.
+            # Without both, the head's autoscaler monitor has no private key
+            # to SSH into newly created workers with -- so workers get
+            # created successfully but every SSH attempt into them fails
+            # with "permission denied". Fail fast here instead of letting
+            # that surface confusingly later during autoscaling.
+            raise ValueError(
+                "cluster config 'auth.ssh_public_key' and 'auth.ssh_private_key' must "
+                "both be set, or both be left unset (in which case this provider "
+                "generates and reuses its own keypair)"
+            )
+
+        if not has_public_key and not has_private_key:
+            # Nothing in Ray generates SSH credentials for the "external"
+            # provider type on its own (unlike e.g. the AWS or vSphere
+            # providers' bootstrap_config, which create a keypair when
+            # auth.ssh_private_key is absent). Without one, SRC workspaces
+            # get created with no authorized key at all and nothing can SSH
+            # into them. Generate (or reuse, across repeated `ray up` runs)
+            # a keypair dedicated to this cluster name instead.
+            generated_private_key, generated_public_key = ResearchCloudNodeProvider._ensure_generated_keypair(
+                cluster_config.get("cluster_name")
+            )
+            auth_config["ssh_public_key"] = str(generated_public_key)
+            auth_config["ssh_private_key"] = str(generated_private_key)
+            public_key = auth_config["ssh_public_key"]
+
+        if "ray_public_key" not in provider_config:
+            public_key_path = Path(public_key).expanduser()
+            provider_config["ray_public_key"] = (
+                public_key_path.read_text(encoding="utf-8").strip()
+                if public_key_path.is_file()
+                else public_key.strip()
+            )
 
         if "node_types" not in provider_config:
             derived_node_types: dict[str, dict[str, Any]] = {}
@@ -268,6 +319,49 @@ class ResearchCloudNodeProvider(NodeProvider):
             provider_config["node_types"] = derived_node_types
 
         return cluster_config
+
+    @staticmethod
+    def _ensure_generated_keypair(cluster_name: Any) -> tuple[Path, Path]:
+        """Generate (or reuse) a local ed25519 keypair for clusters that
+        don't configure their own ``auth.ssh_public_key``/``ssh_private_key``.
+
+        Mirrors the pattern Ray's built-in cloud providers use when no key
+        is configured (e.g. AWS's ``_configure_key_pair``, vSphere's
+        ``configure_key_pair``): the "external" provider type has no such
+        fallback built in, so without this, no explicit keys means no SSH
+        access to either the head node or any worker nodes at all. The
+        keypair is cached under ``SSH_KEY_CACHE_DIR``, keyed by cluster
+        name, so repeated ``ray up`` runs reuse the same identity instead of
+        generating a new, unrecognized key (and SRC workspace) every time.
+
+        Returns the ``(private_key_path, public_key_path)`` pair.
+        """
+        if not isinstance(cluster_name, str) or not cluster_name.strip():
+            raise ValueError(
+                "cluster config 'cluster_name' must be a non-empty string to auto-generate SSH keys"
+            )
+        key_dir = SSH_KEY_CACHE_DIR / sanitize_name_component(cluster_name)
+        private_key_path = key_dir / "id_ed25519"
+        public_key_path = key_dir / "id_ed25519.pub"
+
+        if not private_key_path.is_file() or not public_key_path.is_file():
+            key_dir.mkdir(parents=True, exist_ok=True)
+            private_key = ed25519.Ed25519PrivateKey.generate()
+            private_bytes = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.OpenSSH,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+            public_bytes = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.OpenSSH,
+                format=serialization.PublicFormat.OpenSSH,
+            )
+            fd = os.open(private_key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(private_bytes)
+            public_key_path.write_bytes(public_bytes + b"\n")
+
+        return private_key_path, public_key_path
 
     def __init__(self, provider_config: Dict[str, Any], cluster_name: str) -> None:
         super().__init__(provider_config, cluster_name)

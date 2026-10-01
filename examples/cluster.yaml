@@ -13,6 +13,11 @@ auth:
   ssh_user: ray
   # ssh_private_key: ~/.ssh/...
   # ssh_public_key: ~/.ssh/...
+  # Both must be set together, or both left commented out. If left unset,
+  # the provider generates and reuses its own keypair for this cluster_name
+  # (see README.md). The head node needs the private key (which Ray syncs
+  # onto it automatically) to SSH into newly created worker nodes that were
+  # provisioned with the matching public key.
 
 # The "external" provider type only ships a minimal default config, so these
 # keys (normally filled in by each built-in provider's defaults.yaml) must be

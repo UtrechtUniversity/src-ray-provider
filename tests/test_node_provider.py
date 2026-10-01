@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -162,6 +163,7 @@ class TestBootstrapConfig:
 
     def test_copies_head_node_type_from_cluster_config_top_level(self):
         cluster_config = {
+            "cluster_name": CLUSTER_NAME,
             "head_node_type": "head",
             "available_node_types": {"head": {"node_config": {"size_flavour_name": "2 Core - 8 GB"}}},
             "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
@@ -173,6 +175,7 @@ class TestBootstrapConfig:
 
     def test_adds_provider_installation_to_head_setup_commands(self):
         cluster_config = {
+            "cluster_name": CLUSTER_NAME,
             "head_node_type": "head",
             "available_node_types": {},
             "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
@@ -188,7 +191,7 @@ class TestBootstrapConfig:
         ]
 
     def test_head_setup_install_command_is_added_only_once(self):
-        cluster_config = {"head_setup_commands": []}
+        cluster_config = {"cluster_name": CLUSTER_NAME, "head_setup_commands": []}
 
         ResearchCloudNodeProvider.bootstrap_config(cluster_config)
         ResearchCloudNodeProvider.bootstrap_config(cluster_config)
@@ -201,6 +204,7 @@ class TestBootstrapConfig:
 
     def test_derives_node_types_from_available_node_types_node_config(self):
         cluster_config = {
+            "cluster_name": CLUSTER_NAME,
             "head_node_type": "head",
             "available_node_types": {
                 "head": {"node_config": {"size_flavour_name": "2 Core - 8 GB"}},
@@ -223,6 +227,7 @@ class TestBootstrapConfig:
 
     def test_does_not_override_an_explicit_provider_head_node_type(self):
         cluster_config = {
+            "cluster_name": CLUSTER_NAME,
             "head_node_type": "head",
             "available_node_types": {"head": {"node_config": {"size_flavour_name": "2 Core - 8 GB"}}},
             "provider": {
@@ -239,6 +244,7 @@ class TestBootstrapConfig:
     def test_does_not_override_an_explicit_provider_node_types(self):
         explicit_node_types = {"head": {"size_flavour_name": "explicit-override"}}
         cluster_config = {
+            "cluster_name": CLUSTER_NAME,
             "head_node_type": "head",
             "available_node_types": {"head": {"node_config": {"size_flavour_name": "2 Core - 8 GB"}}},
             "provider": {
@@ -254,6 +260,7 @@ class TestBootstrapConfig:
 
     def test_bootstrapped_config_constructs_a_working_provider(self):
         cluster_config = {
+            "cluster_name": CLUSTER_NAME,
             "head_node_type": "head",
             "available_node_types": {
                 "head": {"node_config": {"size_flavour_name": "2 Core - 8 GB"}},
@@ -267,6 +274,122 @@ class TestBootstrapConfig:
 
         assert provider.head_node_type == "head"
         assert provider._node_type_configs["worker"]["size_flavour_name"] == "4 Core - 16 GB"
+
+    def test_rejects_ssh_public_key_without_ssh_private_key(self):
+        """Ray only syncs auth.ssh_private_key onto the head node (so its
+        autoscaler monitor can SSH into newly created workers) when it is
+        explicitly set. Without it, workers are created successfully but
+        every SSH attempt into them fails with "permission denied" -- fail
+        fast here instead.
+        """
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "available_node_types": {},
+            "auth": {"ssh_user": "ray", "ssh_public_key": "~/.ssh/id_rsa.pub"},
+        }
+
+        with pytest.raises(ValueError, match="ssh_public_key.*ssh_private_key.*must both be set"):
+            ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+    def test_rejects_ssh_private_key_without_ssh_public_key(self):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "available_node_types": {},
+            "auth": {"ssh_user": "ray", "ssh_private_key": "~/.ssh/id_rsa"},
+        }
+
+        with pytest.raises(ValueError, match="ssh_public_key.*ssh_private_key.*must both be set"):
+            ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+    def test_derives_ray_public_key_from_ssh_public_key_file_contents(self, tmp_path):
+        key_path = tmp_path / "id_rsa.pub"
+        key_path.write_text("ssh-ed25519 AAAAfake user@example\n", encoding="utf-8")
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "available_node_types": {},
+            "auth": {
+                "ssh_user": "ray",
+                "ssh_public_key": str(key_path),
+                "ssh_private_key": str(tmp_path / "id_rsa"),
+            },
+        }
+
+        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+        assert result["provider"]["ray_public_key"] == "ssh-ed25519 AAAAfake user@example"
+
+    def test_derives_ray_public_key_from_literal_string_when_not_a_file(self):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "available_node_types": {},
+            "auth": {
+                "ssh_user": "ray",
+                "ssh_public_key": "ssh-ed25519 AAAAfake user@example",
+                "ssh_private_key": "~/.ssh/id_rsa",
+            },
+        }
+
+        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+        assert result["provider"]["ray_public_key"] == "ssh-ed25519 AAAAfake user@example"
+
+    def test_does_not_override_an_explicit_provider_ray_public_key(self):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "available_node_types": {},
+            "auth": {
+                "ssh_user": "ray",
+                "ssh_public_key": "ssh-ed25519 AAAAfake user@example",
+                "ssh_private_key": "~/.ssh/id_rsa",
+            },
+            "provider": {"ray_public_key": "explicit-override"},
+        }
+
+        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+        assert result["provider"]["ray_public_key"] == "explicit-override"
+
+    def test_generates_and_reuses_a_keypair_when_auth_has_no_keys(self, tmp_path, monkeypatch):
+        """Without any auth.ssh_public_key/ssh_private_key, nothing in Ray
+        generates SSH credentials for the "external" provider type -- so
+        without this fallback, SRC workspaces would be created with no
+        authorized key and nothing could SSH into them (see module/method
+        docstrings for the AWS/vSphere precedent this mirrors).
+        """
+        monkeypatch.setattr(
+            "src_ray_provider.node_provider.SSH_KEY_CACHE_DIR", tmp_path / "ssh_keys"
+        )
+        cluster_config = {"cluster_name": CLUSTER_NAME, "available_node_types": {}}
+
+        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+        private_key_path = Path(result["auth"]["ssh_private_key"])
+        public_key_path = Path(result["auth"]["ssh_public_key"])
+        assert private_key_path.is_file()
+        assert public_key_path.is_file()
+        assert result["provider"]["ray_public_key"] == public_key_path.read_text(encoding="utf-8").strip()
+        assert result["provider"]["ray_public_key"].startswith("ssh-ed25519 ")
+
+        # A second bootstrap_config call (e.g. a repeat `ray up`) must reuse
+        # the same keypair rather than generating a new, unrecognized one.
+        second_cluster_config = {"cluster_name": CLUSTER_NAME, "available_node_types": {}}
+        second_result = ResearchCloudNodeProvider.bootstrap_config(second_cluster_config)
+
+        assert second_result["auth"]["ssh_private_key"] == str(private_key_path)
+        assert second_result["provider"]["ray_public_key"] == result["provider"]["ray_public_key"]
+
+    def test_rejects_generating_a_keypair_without_a_cluster_name(self):
+        cluster_config = {"available_node_types": {}}
+
+        with pytest.raises(ValueError, match="cluster_name.*non-empty string"):
+            ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+    def test_rejects_non_mapping_auth(self):
+        cluster_config = {"cluster_name": CLUSTER_NAME, "available_node_types": {}, "auth": "not-a-mapping"}
+
+        with pytest.raises(ValueError, match="'auth' must be a mapping"):
+            ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
 
 
 class TestSanitizeNameComponent:
