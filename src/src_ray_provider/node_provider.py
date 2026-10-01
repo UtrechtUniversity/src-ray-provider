@@ -278,7 +278,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             provider_config, "os_flavour_name", default=DEFAULT_OS_FLAVOUR_NAME
         )
         self.network_name_hint = self._config_value(provider_config, "network_name_hint", optional=True)
-        self.ray_public_key = self._config_value(provider_config, "ray_public_key", optional=False)
+        self.ray_public_key = self._config_value(provider_config, "ray_public_key", optional=True)
         self.workspace_creation_timeout = self._timeout_value(
             provider_config, "workspace_creation_timeout", DEFAULT_WORKSPACE_CREATION_TIMEOUT
         )
