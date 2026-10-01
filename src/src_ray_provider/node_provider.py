@@ -64,6 +64,7 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import tempfile
 import threading
@@ -76,6 +77,7 @@ try:
 except ImportError:  # pragma: no cover - fcntl is POSIX-only; Ray targets POSIX hosts
     fcntl = None
 
+from ray import version as ray_version
 from ray.autoscaler.node_provider import NodeProvider
 from ray.autoscaler.tags import (
     NODE_KIND_HEAD,
@@ -97,10 +99,13 @@ DEFAULT_WORKER_CATALOG_ITEM_NAME = "Ray Worker"
 DEFAULT_OS_FLAVOUR_NAME = "Ubuntu 24.04"
 DEFAULT_WORKSPACE_CREATION_TIMEOUT = 2400
 WORKSPACE_CREATION_POLL_INTERVAL = 5
-PROVIDER_INSTALL_COMMAND = (
-    'python3 -m pip install --upgrade '
-    '"src-ray-provider @ git+https://github.com/UtrechtUniversity/src-ray-provider.git"'
-)
+
+HEAD_SETUP_COMMANDS = [
+    (
+        'VIRTUAL_ENV=ray_venv uv pip install --upgrade '
+        '"src-ray-provider @ git+https://github.com/UtrechtUniversity/src-ray-provider.git"'
+    )
+]
 
 HTTP_NOT_FOUND = 404
 
@@ -241,8 +246,8 @@ class ResearchCloudNodeProvider(NodeProvider):
         head_setup_commands = cluster_config.setdefault("head_setup_commands", [])
         if not isinstance(head_setup_commands, list):
             raise ValueError("cluster config 'head_setup_commands' must be a list")
-        if PROVIDER_INSTALL_COMMAND not in head_setup_commands:
-            head_setup_commands.append(PROVIDER_INSTALL_COMMAND)
+        for cmd in HEAD_SETUP_COMMANDS:
+            head_setup_commands.append(cmd) if cmd not in head_setup_commands
 
         auth_config = cluster_config.get("auth")
         if "ray_public_key" not in provider_config and isinstance(auth_config, Mapping):
@@ -345,6 +350,8 @@ class ResearchCloudNodeProvider(NodeProvider):
         options["optional_parameters"] = {
             "ray_public_key": self.ray_public_key or "",
             "ray_do_setup": "false",
+            "ray_version": ray_version.version,
+            "ray_python_version": platform.python_version()
         }
         return options
 
