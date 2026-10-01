@@ -95,7 +95,7 @@ from researchcloud.utils.flavours import match_size_flavour, validate_size_flavo
 DEFAULT_HEAD_CATALOG_ITEM_NAME = "Ray Head Node"
 DEFAULT_WORKER_CATALOG_ITEM_NAME = "Ray Worker"
 DEFAULT_OS_FLAVOUR_NAME = "Ubuntu 24.04"
-DEFAULT_WORKSPACE_CREATION_TIMEOUT = 1800
+DEFAULT_WORKSPACE_CREATION_TIMEOUT = 2400
 WORKSPACE_CREATION_POLL_INTERVAL = 5
 PROVIDER_INSTALL_COMMAND = (
     'python3 -m pip install --upgrade '
