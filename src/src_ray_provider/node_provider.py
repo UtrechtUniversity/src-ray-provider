@@ -296,21 +296,7 @@ class ResearchCloudNodeProvider(NodeProvider):
                 "generates and reuses its own keypair)"
             )
 
-        # If the private key is set to the default Ray bootstrap key path, it means we're on the head node.
-        # We need to write the corresponding public key and update auth_config accordingly, so the public key can be propagated to workers.
-        if private_key == "~/ray_bootstrap_key.pem":
-            private_key_data = serialization.load_pem_private_key(
-                Path("~/ray_bootstrap_key.pem").read_text(encoding="utf-8").strip(),
-                password=None,
-            )
-            logger.info("DEBUG: Loaded private key from ~/ray_bootstrap_key.pem")
-            public_key_path = Path("~/ray_public.pub").expanduser()
-            public_key_path.write_text(
-                ResearchCloudNodeProvider._public_key_from_private(private_key_data),
-                encoding="utf-8"
-            )
-            auth_config["ssh_public_key"] = str(public_key_path)
-        elif not has_public_key and not has_private_key: # We're on the user's machine where `ray up` is being run
+        if not has_public_key and not has_private_key:
             # Nothing in Ray generates SSH credentials for the "external"
             # provider type on its own (unlike e.g. the AWS or vSphere
             # providers' bootstrap_config, which create a keypair when
@@ -321,13 +307,13 @@ class ResearchCloudNodeProvider(NodeProvider):
             generated_private_key, generated_public_key = ResearchCloudNodeProvider._ensure_generated_keypair(
                 cluster_config.get("cluster_name")
             )
-            auth_config["ssh_public_key"] = str(generated_public_key)
             auth_config["ssh_private_key"] = str(generated_private_key)
+            auth_config["ssh_public_key"] = str(generated_public_key)
 
-        logger.debug("DEBUG: Reading public key from ssh_public_key path")
         provider_config["ray_public_key_data"] = (
             Path(auth_config["ssh_public_key"]).read_text(encoding="utf-8").strip()
         )
+        auth_config["ssh_public_key"] = "/home/ray/ray_public.pub" # now that we've read the public key from disk, override the path to point to the location on the remote node. The key will be placed there by the SRC component.
 
         if "node_types" not in provider_config:
             derived_node_types: dict[str, dict[str, Any]] = {}
@@ -342,17 +328,6 @@ class ResearchCloudNodeProvider(NodeProvider):
             provider_config["node_types"] = derived_node_types
 
         return cluster_config
-
-    @staticmethod
-    def _public_key_from_private(private_key_data: str) -> str:
-        """From the given private key bytes, return the corresponding public key in OpenSSH format.
-        
-        Returns a string containing the corresponding public key in OpenSSH format.
-        """
-        return private_key_data.public_key().public_bytes(
-            encoding=serialization.Encoding.OpenSSH,
-            format=serialization.PublicFormat.OpenSSH,
-        ).decode('utf-8')
 
     @staticmethod
     def _ensure_generated_keypair(cluster_name: Any) -> tuple[Path, Path]:
@@ -583,7 +558,7 @@ class ResearchCloudNodeProvider(NodeProvider):
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.workspace_creation_timeout
-        while self._workspace_status(workspace) == "creating":
+        while self._workspace_status(workspace) != "running":
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise TimeoutError(
