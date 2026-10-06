@@ -116,8 +116,6 @@ DEFAULT_OS_FLAVOUR_NAME = "Ubuntu 24.04"
 DEFAULT_WORKSPACE_CREATION_TIMEOUT = 2400
 WORKSPACE_CREATION_POLL_INTERVAL = 5
 
-HEAD_SETUP_COMMANDS = [] # default head setup commands, currenly empty
-
 HTTP_NOT_FOUND = 404
 
 _NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_\-]+")
@@ -298,7 +296,21 @@ class ResearchCloudNodeProvider(NodeProvider):
                 "generates and reuses its own keypair)"
             )
 
-        if not has_public_key and not has_private_key:
+        # If the private key is set to the default Ray bootstrap key path, it means we're on the head node.
+        # We need to write the corresponding public key and update auth_config accordingly, so the public key can be propagated to workers.
+        if private_key == "~/ray_bootstrap_key.pem":
+            private_key_data = serialization.load_pem_private_key(
+                Path("~/ray_bootstrap_key.pem").read_text(encoding="utf-8").strip(),
+                password=None,
+            )
+            logger.info("DEBUG: Loaded private key from ~/ray_bootstrap_key.pem")
+            public_key_path = Path("~/ray_public.pub").expanduser()
+            public_key_path.write_text(
+                ResearchCloudNodeProvider._public_key_from_private(private_key_data),
+                encoding="utf-8"
+            )
+            auth_config["ssh_public_key"] = str(public_key_path)
+        elif not has_public_key and not has_private_key: # We're on the user's machine where `ray up` is being run
             # Nothing in Ray generates SSH credentials for the "external"
             # provider type on its own (unlike e.g. the AWS or vSphere
             # providers' bootstrap_config, which create a keypair when
@@ -310,17 +322,12 @@ class ResearchCloudNodeProvider(NodeProvider):
                 cluster_config.get("cluster_name")
             )
             auth_config["ssh_public_key"] = str(generated_public_key)
-            if auth_config["ssh_private_key"] != "~/ray_bootstrap_key.pem":
-                auth_config["ssh_private_key"] = str(generated_private_key)
+            auth_config["ssh_private_key"] = str(generated_private_key)
 
-        if "ray_public_key" not in provider_config:
-            provider_config["ray_public_key"] = (
-                Path(auth_config["ssh_public_key"]).read_text(encoding="utf-8").strip()
-            )
-        if "ray_private_key" not in provider_config:
-            provider_config["ray_private_key"] = (
-                Path(auth_config["ssh_private_key"]).read_text(encoding="utf-8").strip()
-            )
+        logger.debug("DEBUG: Reading public key from ssh_public_key path")
+        provider_config["ray_public_key_data"] = (
+            Path(auth_config["ssh_public_key"]).read_text(encoding="utf-8").strip()
+        )
 
         if "node_types" not in provider_config:
             derived_node_types: dict[str, dict[str, Any]] = {}
@@ -335,6 +342,17 @@ class ResearchCloudNodeProvider(NodeProvider):
             provider_config["node_types"] = derived_node_types
 
         return cluster_config
+
+    @staticmethod
+    def _public_key_from_private(private_key_data: str) -> str:
+        """From the given private key bytes, return the corresponding public key in OpenSSH format.
+        
+        Returns a string containing the corresponding public key in OpenSSH format.
+        """
+        return private_key_data.public_key().public_bytes(
+            encoding=serialization.Encoding.OpenSSH,
+            format=serialization.PublicFormat.OpenSSH,
+        ).decode('utf-8')
 
     @staticmethod
     def _ensure_generated_keypair(cluster_name: Any) -> tuple[Path, Path]:
@@ -361,6 +379,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         public_key_path = key_dir / "id_ed25519.pub"
 
         if not private_key_path.is_file() or not public_key_path.is_file():
+            cli_logger.info(f"Generating new SSH keypair for cluster in {key_dir}. You may want to back up the keypair to a more persistent location.")
             key_dir.mkdir(parents=True, exist_ok=True)
             private_key = ed25519.Ed25519PrivateKey.generate()
             private_bytes = private_key.private_bytes(
@@ -368,18 +387,16 @@ class ResearchCloudNodeProvider(NodeProvider):
                 format=serialization.PrivateFormat.OpenSSH,
                 encryption_algorithm=serialization.NoEncryption(),
             )
-            public_bytes = private_key.public_key().public_bytes(
-                encoding=serialization.Encoding.OpenSSH,
-                format=serialization.PublicFormat.OpenSSH,
-            )
+            public_key_text = ResearchCloudNodeProvider._public_key_from_private(private_bytes)
             fd = os.open(private_key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(private_bytes)
-            public_key_path.write_bytes(public_bytes + b"\n")
+            public_key_path.write_text(public_key_text + "\n", encoding="utf-8")
 
         return private_key_path, public_key_path
 
     def __init__(self, provider_config: Dict[str, Any], cluster_name: str) -> None:
+        cli_logger.info("Initializing ResearchCloud provider...")
         super().__init__(provider_config, cluster_name)
         self.co_name = self._config_value(provider_config, "co_name")
         self.wallet_name = self._config_value(provider_config, "wallet_name")
@@ -388,8 +405,8 @@ class ResearchCloudNodeProvider(NodeProvider):
             provider_config, "os_flavour_name", default=DEFAULT_OS_FLAVOUR_NAME
         )
         self.network_name_hint = self._config_value(provider_config, "network_name_hint", optional=True)
-        self.ray_public_key = self._config_value(provider_config, "ray_public_key", optional=True)
-        self.ray_private_key = self._config_value(provider_config, "ray_private_key", optional=True)
+        self.ray_public_key_data = self._config_value(provider_config, "ray_public_key_data")
+
         self.workspace_creation_timeout = self._timeout_value(
             provider_config, "workspace_creation_timeout", DEFAULT_WORKSPACE_CREATION_TIMEOUT
         )
@@ -454,7 +471,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         }
 
         options["optional_parameters"] = {
-            "ray_public_key": self.ray_public_key or "",
+            "ray_public_key": self.ray_public_key_data,
             "ray_do_setup": "false",
             "ray_version": ray_version.version,
             "ray_python_version": platform.python_version()
