@@ -313,8 +313,8 @@ class ResearchCloudNodeProvider(NodeProvider):
         provider_config["ray_public_key_data"] = (
             Path(auth_config["ssh_public_key"]).read_text(encoding="utf-8").strip()
         )
-        auth_config["ssh_public_key"] = "/home/ray/ray_public.pub" # now that we've read the public key from disk, override the path to point to the location on the remote node. The key will be placed there by the SRC component.
-
+        auth_config.pop("ssh_public_key")
+        
         if "node_types" not in provider_config:
             derived_node_types: dict[str, dict[str, Any]] = {}
             for node_type, node_type_config in cluster_config.get("available_node_types", {}).items():
