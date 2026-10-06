@@ -267,8 +267,6 @@ class ResearchCloudNodeProvider(NodeProvider):
             cli_logger.abort(f"Failed to load defaults.yaml: {e}")
         cluster_config = deep_merge(defaults, cluster_config)
 
-        cli_logger.info(f"Merged cluster configuration with defaults. Final cluster configuration: {cluster_config}")
-
         provider_config = cluster_config.setdefault("provider", {})
         provider_config.setdefault("head_node_type", cluster_config.get("head_node_type"))
 
@@ -314,7 +312,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             Path(auth_config["ssh_public_key"]).read_text(encoding="utf-8").strip()
         )
         auth_config.pop("ssh_public_key")
-        
+
         if "node_types" not in provider_config:
             derived_node_types: dict[str, dict[str, Any]] = {}
             for node_type, node_type_config in cluster_config.get("available_node_types", {}).items():
@@ -371,7 +369,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         return private_key_path, public_key_path
 
     def __init__(self, provider_config: Dict[str, Any], cluster_name: str) -> None:
-        cli_logger.info("Initializing ResearchCloud provider...")
+        cli_logger.info(f"Initializing ResearchCloud provider...  Provider config: {provider_config}")
         super().__init__(provider_config, cluster_name)
         self.co_name = self._config_value(provider_config, "co_name")
         self.wallet_name = self._config_value(provider_config, "wallet_name")
@@ -529,6 +527,7 @@ class ResearchCloudNodeProvider(NodeProvider):
                     workspace_name=workspace_name,
                     **self._workspace_creation_options(node_type),
                 )
+                cli_logger.info(f"Creating SRC workspace {workspace_name} for Ray node type {node_type}... with payload: {plan.payload}")
                 try:
                     workspace = await client.workspaces.create(plan.payload)
                 except ApiError as exc:
@@ -553,7 +552,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         workspace: dict[str, Any],
     ) -> dict[str, Any]:
         """Wait for SRC to finish its ``creating`` phase before returning a node to Ray."""
-        if self._workspace_status(workspace) != "creating":
+        if self._workspace_status(workspace) == "running":
             return workspace
 
         loop = asyncio.get_running_loop()
@@ -562,13 +561,17 @@ class ResearchCloudNodeProvider(NodeProvider):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise TimeoutError(
-                    f"SRC workspace {workspace_id!r} remained in 'creating' state for "
+                    f"SRC workspace {workspace_id!r} did not reach 'running' state for "
                     f"{self.workspace_creation_timeout:g} seconds"
                 )
             await asyncio.sleep(min(WORKSPACE_CREATION_POLL_INTERVAL, remaining))
             workspace = await client.workspaces.get(workspace_id)
             self._workspace_id(workspace)
-            self._workspace_status(workspace)
+            if self._workspace_status(workspace) == "failed": # todo: fix this
+                raise (
+                    f"SRC workspace {workspace_id!r} failed to create: {self._workspace_status(workspace)!r}"
+                )
+
         return workspace
 
     def _default_catalog_item_name(self, node_type: str) -> str:
