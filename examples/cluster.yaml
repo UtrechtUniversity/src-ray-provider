@@ -8,6 +8,8 @@ provider:
   module: src_ray_provider.node_provider.ResearchCloudNodeProvider
   co_name: Example CO
   wallet_name: Example Wallet
+  cloud_name: SURF HPC Cloud # this is the default and can be left out. You can alter it for AWS etc.
+  # network_name_hint: example-network # if there are multiple networks, this helps the provider choose the correct one
 
 auth:
   ssh_user: ray
@@ -31,14 +33,6 @@ file_mounts_sync_continuously: false
 rsync_exclude: []
 rsync_filter: []
 
-# TESTING ONLY: replace the placeholder before launching. The token is written
-# to a head-only file with owner-only permissions, then supplied to `ray start`
-# so the autoscaler monitor inherits it. This exposes the token in this
-# cluster config and potentially command logs; do not use for shared/production
-# clusters. Remove these commands after testing.
-head_setup_commands:
-  - "umask 077 && printf '%s' 'REPLACE_WITH_SRC_TOKEN' > ~/.researchcloud-token"
-
 head_start_ray_commands:
   - ray stop
   - >-
@@ -59,14 +53,14 @@ available_node_types:
   head:
     min_workers: 0
     max_workers: 0
-    resources: {"CPU": 2}
+    resources: {"CPU": 1}
     node_config:
-      size_flavour_name: 2 Core - 8 GB
+      size_flavour_name: 1 Core - 8 GB RAM
   worker:
     min_workers: 1
     max_workers: 4
-    resources: {"CPU": 1}
+    resources: {"CPU": 2}
     node_config:
-      num_cpu: 1
+      num_cpu: 2
 
 idle_timeout_minutes: 10

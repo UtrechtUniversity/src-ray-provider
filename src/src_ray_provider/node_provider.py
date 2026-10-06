@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import math
@@ -79,6 +80,7 @@ import re
 import tempfile
 import threading
 import uuid
+import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
@@ -99,6 +101,7 @@ from ray.autoscaler.tags import (
     TAG_RAY_NODE_KIND,
     TAG_RAY_USER_NODE_TYPE,
 )
+from ray.autoscaler._private.cli_logger import cli_logger
 
 from researchcloud.client import ResearchCloudClient
 from researchcloud.config import DEFAULT_CLOUD_NAME
@@ -124,6 +127,20 @@ logger = logging.getLogger(__name__)
 NODE_TAG_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "node_tags"
 SSH_KEY_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "ssh_keys"
 
+def deep_merge(base: dict, override: dict) -> dict:
+    """Return base overlaid with override."""
+    out = copy.deepcopy(base)
+    for key, val in override.items():
+        if isinstance(val, list):
+            existing = out.get(key, None)
+            if existing is not None and not isinstance(existing, list):
+                raise TypeError(f"'{key}' needs a list on both sides (got {type(existing).__name__} and {type(val).__name__})")
+            out[key] = (existing or []) + copy.deepcopy(val)
+        elif isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], val)
+        else:
+            out[key] = copy.deepcopy(val)
+    return out
 
 @contextlib.contextmanager
 def _locked_cache_file(lock_path: Path):
@@ -243,29 +260,27 @@ class ResearchCloudNodeProvider(NodeProvider):
 
     @staticmethod
     def bootstrap_config(cluster_config: Dict[str, Any]) -> Dict[str, Any]:
-        """Fill in ``provider.head_node_type``/``provider.node_types`` from
-        cluster.yaml's top-level ``head_node_type``/``available_node_types``
-        so cluster.yaml authors don't have to duplicate them under
-        ``provider:`` by hand. Existing ``provider:`` values are left alone,
-        so an explicit override still takes precedence.
-        """
+        """Bootstrap the provider configuration by merging defaults with the cluster configuration."""
+        cli_logger.info("Bootstrapping provider configuration")
+
+        try:
+            defaults = yaml.safe_load((Path(__file__).parent.resolve() / "defaults.yaml").read_text())
+        except Exception as e:
+            cli_logger.abort(f"Failed to load defaults.yaml: {e}")
+        cluster_config = deep_merge(defaults, cluster_config)
+
+        cli_logger.info(f"Merged cluster configuration with defaults. Final cluster configuration: {cluster_config}")
+
         provider_config = cluster_config.setdefault("provider", {})
         provider_config.setdefault("head_node_type", cluster_config.get("head_node_type"))
 
-        head_setup_commands = cluster_config.setdefault("head_setup_commands", [])
-        if not isinstance(head_setup_commands, list):
-            raise ValueError("cluster config 'head_setup_commands' must be a list")
-        for cmd in HEAD_SETUP_COMMANDS:
-            head_setup_commands.append(cmd) if cmd not in head_setup_commands else None
-
-        auth_config = cluster_config.setdefault("auth", {})
-        if not isinstance(auth_config, dict):
-            raise ValueError("cluster config 'auth' must be a mapping")
+        auth_config = cluster_config["auth"]
 
         public_key = auth_config.get("ssh_public_key")
         private_key = auth_config.get("ssh_private_key")
         has_public_key = isinstance(public_key, str) and bool(public_key.strip())
         has_private_key = isinstance(private_key, str) and bool(private_key.strip())
+
         if has_public_key != has_private_key:
             # Ray only copies auth.ssh_private_key onto the head node (as
             # ~/ray_bootstrap_key.pem, see ray.autoscaler._private.commands

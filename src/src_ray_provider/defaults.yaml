@@ -1,0 +1,37 @@
+auth:
+  ssh_user: ray
+
+#todo: add ulimit
+head_start_ray_commands:
+  - source ray_head.env && ray stop
+  - >-
+    source ray_head.env && ray start --head
+    --disable-usage-stats
+    --node-ip-address "$RAY_NODE_IP_ADDRESS"
+    --head
+    --port "$RAY_PORT"
+    --dashboard-port "$RAY_DASHBOARD_PORT"
+    --num-cpus=0
+    --autoscaling-config=ray_bootstrap_config.yaml
+
+#todo: add ulimit
+worker_start_ray_commands:
+  - source ray_worker.env && ray stop
+  - >-
+   source ray_worker.env && ray start
+   --disable-usage-stats
+   --node-ip-address "$RAY_NODE_IP_ADDRESS"
+   --address "$RAY_HEAD_IP"
+
+initialization_commands: []
+worker_setup_commands: []
+file_mounts: {}
+cluster_synced_files: []
+file_mounts_sync_continuously: false
+rsync_exclude: []
+rsync_filter: []
+setup_commands: []
+
+max_workers: 0
+
+idle_timeout_minutes: 10
