@@ -23,7 +23,8 @@ worker_start_ray_commands:
    --node-ip-address "$RAY_NODE_IP_ADDRESS"
    --address "$RAY_HEAD_IP"
 
-initialization_commands: []
+initialization_commands: 
+head_setup_commands: []
 worker_setup_commands: []
 file_mounts: {}
 cluster_synced_files: []
