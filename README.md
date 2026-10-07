@@ -1,8 +1,10 @@
 # SRC Ray Provider
 
-Ray autoscaler node provider for SURF ResearchCloud (SRC). This project is
-structured as a standalone Python package and can be copied into its own
-`UtrechtUniversity/src-ray-provider` repository.
+Ray autoscaler node provider for SURF ResearchCloud (SRC) (read more [here](https://utrechtuniversity.github.io/re-presentation-src-ray/slides.html#/ray-on-surf-researchcloud)).
+
+**Currently in beta -- contact research.engineering@uu.nl if you would like to use this.** We will need to provide you with access to certain ResearchCloud catalog items.
+
+**Security note**: to use Ray on SRC, you currently need to save an API key in a secret `RAY_SCR_TOKEN` inside your Collaboration. At the moment, ResearchCloud API keys cannot yet be scoped to a specific CO (coming soon), so it is best to test this package in a Collaboration to which only you have access.
 
 ## Installation
 
