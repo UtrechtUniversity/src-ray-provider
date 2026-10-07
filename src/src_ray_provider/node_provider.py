@@ -447,7 +447,8 @@ class ResearchCloudNodeProvider(NodeProvider):
             "ray_public_key": self.ray_public_key_data,
             "ray_do_setup": "false",
             "ray_version": ray_version.version,
-            "ray_python_version": platform.python_version()
+            "ray_python_version": platform.python_version(),
+            "ray_packages": "default", # todo: make this configurable
         }
         return options
 
