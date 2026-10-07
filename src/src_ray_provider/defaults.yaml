@@ -21,7 +21,7 @@ worker_start_ray_commands:
    source ray_worker.env && ray start
    --disable-usage-stats
    --node-ip-address "$RAY_NODE_IP_ADDRESS"
-   --address "$RAY_HEAD_IP"
+   --address "$RAY_HEAD_IP:$RAY_PORT"
 
 initialization_commands: 
 head_setup_commands: []
