@@ -259,7 +259,7 @@ class ResearchCloudNodeProvider(NodeProvider):
     @staticmethod
     def bootstrap_config(cluster_config: Dict[str, Any]) -> Dict[str, Any]:
         """Bootstrap the provider configuration by merging defaults with the cluster configuration."""
-        cli_logger.info("Bootstrapping provider configuration")
+        cli_logger.verbose("Bootstrapping provider configuration")
 
         try:
             defaults = yaml.safe_load((Path(__file__).parent.resolve() / "defaults.yaml").read_text())
@@ -352,7 +352,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         public_key_path = key_dir / "id_ed25519.pub"
 
         if not private_key_path.is_file() or not public_key_path.is_file():
-            cli_logger.info(f"Generating new SSH keypair for cluster in {key_dir}. You may want to back up the keypair to a more persistent location.")
+            cli_logger.verbose(f"Generating new SSH keypair for cluster in {key_dir}. You may want to back up the keypair to a more persistent location.")
             key_dir.mkdir(parents=True, exist_ok=True)
             private_key = ed25519.Ed25519PrivateKey.generate()
             private_bytes = private_key.private_bytes(
@@ -369,7 +369,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         return private_key_path, public_key_path
 
     def __init__(self, provider_config: Dict[str, Any], cluster_name: str) -> None:
-        cli_logger.info(f"Initializing ResearchCloud provider...  Provider config: {provider_config}")
+        cli_logger.verbose(f"Initializing ResearchCloud provider...  Provider config: {provider_config}")
         super().__init__(provider_config, cluster_name)
         self.co_name = self._config_value(provider_config, "co_name")
         self.wallet_name = self._config_value(provider_config, "wallet_name")
@@ -528,7 +528,7 @@ class ResearchCloudNodeProvider(NodeProvider):
                     workspace_name=workspace_name,
                     **self._workspace_creation_options(node_type),
                 )
-                cli_logger.info(f"Creating SRC workspace {workspace_name} for Ray node type {node_type}... with payload: {plan.payload}")
+                cli_logger.verbose(f"Creating SRC workspace {workspace_name} for Ray node type {node_type}... with payload: {plan.payload}")
                 try:
                     workspace = await client.workspaces.create(plan.payload)
                 except ApiError as exc:
