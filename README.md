@@ -10,10 +10,10 @@ Ray autoscaler node provider for SURF ResearchCloud (SRC) (read more [here](http
 
 1. Clone this repo, `cd` into it.
 1. Ensure you have a virtual environment active for this project.
-1. Install: `python -m pip install .`
-1. Edit cluster config (create `cluster.yaml`)
+1. [Install](#installation): `python -m pip install .`
+1. [Edit cluster config](#cluster-config) (create `cluster.yaml`)
 1. Set your ResearchCloud API token: `export RESEARCH_CLOUD_TOKEN="foo"`
-1. `ray up cluster.yaml` and wait for the head node to start.
+1. `ray up cluster.yaml` to create the cluster. Wait for the head node to start.
 1. `ray dashboard cluster.yaml` (to create an SSH tunnel to the head node, allowing you to submit jobs)
 1. Submit a job from the example `jobs` directory: `ray job submit --address http://localhost:8265 --runtime-env-json='{"working_dir": "jobs", "pip": "jobs/requirements.txt"}' -- python3 test.py`
 
