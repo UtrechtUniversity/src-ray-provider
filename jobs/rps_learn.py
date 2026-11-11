@@ -1,10 +1,6 @@
 import gymnasium as gym
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 
-import gymnasium as gym
-from ray.rllib.env.multi_agent_env import MultiAgentEnv
-
-
 class RockPaperScissors(MultiAgentEnv):
     def __init__(self, config=None):
         super().__init__()
@@ -54,11 +50,28 @@ from ray.rllib.policy.policy import PolicySpec
 config = (
     PPOConfig()
     .environment(RockPaperScissors, env_config={"max_steps": 10})
+    # 1. Hardware Resource Specs Allocation
+    .resources(
+        num_cpus_for_main_process=1,       # Dedicates 1 CPU core to the coordinator/driver process
+        num_gpus_for_main_process=0,       # Keeps the driver on the CPU
+    )
+    .env_runners(
+        num_env_runners=2,                 # Launches 2 parallel processes gathering trajectory rollouts
+        num_cpus_per_env_runner=1,         # Allocates 1 CPU core per rollout worker process
+        num_gpus_per_env_runner=0,         # Pure text/math env; no GPUs needed for simulation steps
+    )
+    .learners(
+        num_learners=1,                    # 1 Learner worker to optimize neural network policies
+        num_cpus_per_learner=1,            # 1 CPU allocated to handle gradient preprocessing
+        num_gpus_per_learner=0,            # Set to 1 if you have a physical GPU available and want to use it
+    )
+    # 2. Multi-agent configuration mapping
     .multi_agent(
         policies={"p1": PolicySpec(), "p2": PolicySpec()},
         policy_mapping_fn=lambda agent_id, *a, **kw: "p1" if agent_id == "agent_1" else "p2",
     )
 )
+
 algo = config.build()
 for i in range(5):
     result = algo.train()
