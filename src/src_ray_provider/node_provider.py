@@ -592,7 +592,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         return private_key_path, public_key_path
 
     def __init__(self, provider_config: Dict[str, Any], cluster_name: str) -> None:
-        cli_logger.verbose(f"Initializing ResearchCloud provider...  Provider config: {provider_config}")
+        cli_logger.verbose("Initializing ResearchCloud provider...  Provider config: {}", provider_config)
         super().__init__(provider_config, cluster_name)
         self.co_name = self._config_value(provider_config, "co_name")
         self.wallet_name = self._config_value(provider_config, "wallet_name")
