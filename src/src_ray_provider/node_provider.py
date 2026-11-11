@@ -583,7 +583,10 @@ class ResearchCloudNodeProvider(NodeProvider):
                 format=serialization.PrivateFormat.OpenSSH,
                 encryption_algorithm=serialization.NoEncryption(),
             )
-            public_key_text = ResearchCloudNodeProvider._public_key_from_private(private_bytes)
+            public_key_text = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.OpenSSH,
+                format=serialization.PublicFormat.OpenSSH,
+            ).decode("utf-8")
             fd = os.open(private_key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(private_bytes)
@@ -751,7 +754,12 @@ class ResearchCloudNodeProvider(NodeProvider):
                     workspace_name=workspace_name,
                     **self._workspace_creation_options(node_type),
                 )
-                cli_logger.verbose(f"Creating SRC workspace {workspace_name} for Ray node type {node_type}... with payload: {plan.payload}")
+                cli_logger.verbose(
+                    "Creating SRC workspace {} for Ray node type {}... with payload: {}",
+                    workspace_name,
+                    node_type,
+                    plan.payload,
+                )
                 try:
                     workspace = await client.workspaces.create(plan.payload)
                 except ApiError as exc:
