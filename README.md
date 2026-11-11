@@ -80,22 +80,24 @@ by the normalized size-flavour name. `node_config.catalog_item_name` can be
 overridden per node type; the default remains `Ray Head Node` or `Ray Worker`
 according to the generated type.
 
-**Note:** if you set `auth.ssh_private_key` and `auth.ssh_public_key` in the
-provider block to paths to those respective keys, **both keys will be uploaded to the head node**.
-You may not want to do this with your normal private key. **Just
-leave `auth.ssh_private_key` and `auth.ssh_public_key` unset, and the provider will generate a dedicated keypair instead.**
+Set `auth.ssh_private_key` and `auth.ssh_public_key` together to paths to a
+private key and its matching public key, or leave both unset to generate and
+reuse a dedicated keypair for the cluster. Ray copies the private key to the
+head node, so avoid using your normal private key. The provider reads the
+public-key file during bootstrap and passes its contents to the SRC catalog
+item.
 
-When an SRC workspace is returned in the `creating` state, the provider polls
-until that state changes before returning the node to Ray. The wait is bounded
-by `provider.workspace_creation_timeout` (seconds), which defaults to 1800:
+The provider polls an SRC workspace until it reaches `running` before returning
+the node to Ray. The wait is bounded by `provider.workspace_creation_timeout`
+(seconds), which defaults to 2400:
 
 ```yaml
 provider:
-  workspace_creation_timeout: 1800
+  workspace_creation_timeout: 2400
 ```
 
 The provider checks every five seconds and raises a timeout error if the
-workspace remains `creating` past this limit.
+workspace does not reach `running` within this limit.
 
 ## Development
 
