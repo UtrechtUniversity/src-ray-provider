@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import platform
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from cryptography.hazmat.primitives import serialization
+from ray import _version as ray_version
 from ray.autoscaler.tags import (
     NODE_KIND_HEAD,
     NODE_KIND_WORKER,
@@ -30,6 +33,7 @@ def _provider_config(**overrides) -> dict:
     config = {
         "co_name": "Example CO",
         "wallet_name": "Example Wallet",
+        "ray_public_key_data": PUBLIC_KEY,
         "head_node_type": "head",
         "node_types": {
             "head": {"size_flavour_name": "2 Core - 8 GB"},
@@ -42,6 +46,14 @@ def _provider_config(**overrides) -> dict:
 
 CLUSTER_NAME = "test-cluster"
 CLUSTER_PREFIX = f"ray-{CLUSTER_NAME}-"
+PUBLIC_KEY = "ssh-ed25519 AAAAfake test@example"
+EXPECTED_OPTIONAL_PARAMETERS = {
+    "ray_public_key": PUBLIC_KEY,
+    "ray_do_setup": "false",
+    "ray_version": ray_version.version,
+    "ray_python_version": platform.python_version(),
+    "ray_packages": "default",
+}
 
 
 def test_provider_configuration_uses_defaults():
@@ -58,7 +70,7 @@ def test_provider_configuration_uses_defaults():
         "size_flavour_name": "2 Core - 8 GB",
         "use_private_network": True,
         "network_name_hint": None,
-        "optional_parameters": {"ray_public_key": "", "ray_do_setup": "false"},
+        "optional_parameters": EXPECTED_OPTIONAL_PARAMETERS,
     }
     assert provider._workspace_creation_options("worker") == {
         "catalog_item_name": DEFAULT_WORKER_CATALOG_ITEM_NAME,
@@ -67,7 +79,7 @@ def test_provider_configuration_uses_defaults():
         "size_flavour_name": "4 Core - 16 GB",
         "use_private_network": True,
         "network_name_hint": None,
-        "optional_parameters": {"ray_public_key": "", "ray_do_setup": "false"},
+        "optional_parameters": EXPECTED_OPTIONAL_PARAMETERS,
     }
 
 
@@ -92,7 +104,7 @@ def test_provider_configuration_allows_overrides():
         "size_flavour_name": "8 Core - 32 GB",
         "use_private_network": True,
         "network_name_hint": "ray-private",
-        "optional_parameters": {"ray_public_key": "", "ray_do_setup": "false"},
+        "optional_parameters": EXPECTED_OPTIONAL_PARAMETERS,
     }
 
 
@@ -102,10 +114,17 @@ def test_workspace_creation_timeout_must_be_a_positive_finite_number(timeout):
         ResearchCloudNodeProvider(_provider_config(workspace_creation_timeout=timeout), CLUSTER_NAME)
 
 
-@pytest.mark.parametrize("key", ["co_name", "wallet_name", "head_node_type"])
+@pytest.mark.parametrize("key", ["co_name", "wallet_name", "head_node_type", "ray_public_key_data"])
 def test_required_provider_configuration_must_be_non_empty(key):
     with pytest.raises(ValueError, match=key):
         ResearchCloudNodeProvider(_provider_config(**{key: "  "}), CLUSTER_NAME)
+
+
+def test_public_key_data_is_required():
+    config = _provider_config()
+    del config["ray_public_key_data"]
+    with pytest.raises(ValueError, match="ray_public_key_data"):
+        ResearchCloudNodeProvider(config, CLUSTER_NAME)
 
 
 def test_exactly_one_sizing_strategy_is_required_for_each_node_type():
@@ -288,7 +307,7 @@ class TestBootstrapConfig:
             "size_flavour_name": "8 Core - 32 GB RAM",
         }
 
-    def test_adds_provider_installation_to_head_setup_commands(self):
+    def test_preserves_head_setup_commands(self):
         cluster_config = {
             "cluster_name": CLUSTER_NAME,
             "head_node_type": "head",
@@ -299,23 +318,17 @@ class TestBootstrapConfig:
 
         result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
 
-        assert result["head_setup_commands"] == [
-            "echo custom setup",
-            'python3 -m pip install --upgrade "src-ray-provider @ '
-            "git+https://github.com/UtrechtUniversity/src-ray-provider.git\"",
-        ]
+        assert result["head_setup_commands"] == ["echo custom setup"]
 
-    def test_head_setup_install_command_is_added_only_once(self):
-        cluster_config = {"cluster_name": CLUSTER_NAME, "head_setup_commands": []}
+    def test_defaults_head_setup_commands_to_empty_list(self):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
+        }
 
-        ResearchCloudNodeProvider.bootstrap_config(cluster_config)
-        ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
 
-        assert len(cluster_config["head_setup_commands"]) == 1
-
-    def test_rejects_non_list_head_setup_commands(self):
-        with pytest.raises(ValueError, match="head_setup_commands.*list"):
-            ResearchCloudNodeProvider.bootstrap_config({"head_setup_commands": "echo setup"})
+        assert result["head_setup_commands"] == []
 
     def test_derives_node_types_from_available_node_types_node_config(self):
         cluster_config = {
@@ -463,6 +476,7 @@ class TestBootstrapConfig:
         cluster_config = {
             "cluster_name": CLUSTER_NAME,
             "available_node_types": {},
+            "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
             "auth": {
                 "ssh_user": "ray",
                 "ssh_public_key": str(key_path),
@@ -472,9 +486,11 @@ class TestBootstrapConfig:
 
         result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
 
-        assert result["provider"]["ray_public_key"] == "ssh-ed25519 AAAAfake user@example"
+        assert result["provider"]["ray_public_key_data"] == "ssh-ed25519 AAAAfake user@example"
+        assert "ssh_public_key" not in result["auth"]
+        assert result["auth"]["ssh_private_key"] == str(tmp_path / "id_rsa")
 
-    def test_derives_ray_public_key_from_literal_string_when_not_a_file(self):
+    def test_rejects_literal_public_key_instead_of_file_path(self):
         cluster_config = {
             "cluster_name": CLUSTER_NAME,
             "available_node_types": {},
@@ -485,25 +501,30 @@ class TestBootstrapConfig:
             },
         }
 
-        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+        with pytest.raises(FileNotFoundError):
+            ResearchCloudNodeProvider.bootstrap_config(cluster_config)
 
-        assert result["provider"]["ray_public_key"] == "ssh-ed25519 AAAAfake user@example"
-
-    def test_does_not_override_an_explicit_provider_ray_public_key(self):
+    def test_public_key_file_overrides_provider_public_key_data(self, tmp_path):
+        key_path = tmp_path / "id_ed25519.pub"
+        key_path.write_text(PUBLIC_KEY + "\n", encoding="utf-8")
         cluster_config = {
             "cluster_name": CLUSTER_NAME,
             "available_node_types": {},
             "auth": {
                 "ssh_user": "ray",
-                "ssh_public_key": "ssh-ed25519 AAAAfake user@example",
+                "ssh_public_key": str(key_path),
                 "ssh_private_key": "~/.ssh/id_rsa",
             },
-            "provider": {"ray_public_key": "explicit-override"},
+            "provider": {
+                "co_name": "Example CO",
+                "wallet_name": "Example Wallet",
+                "ray_public_key_data": "explicit-override",
+            },
         }
 
         result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
 
-        assert result["provider"]["ray_public_key"] == "explicit-override"
+        assert result["provider"]["ray_public_key_data"] == PUBLIC_KEY
 
     def test_generates_and_reuses_a_keypair_when_auth_has_no_keys(self, tmp_path, monkeypatch):
         """Without any auth.ssh_public_key/ssh_private_key, nothing in Ray
@@ -515,24 +536,42 @@ class TestBootstrapConfig:
         monkeypatch.setattr(
             "src_ray_provider.node_provider.SSH_KEY_CACHE_DIR", tmp_path / "ssh_keys"
         )
-        cluster_config = {"cluster_name": CLUSTER_NAME, "available_node_types": {}}
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "available_node_types": {},
+            "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
+        }
 
         result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
 
         private_key_path = Path(result["auth"]["ssh_private_key"])
-        public_key_path = Path(result["auth"]["ssh_public_key"])
+        public_key_path = tmp_path / "ssh_keys" / CLUSTER_NAME / "id_ed25519.pub"
         assert private_key_path.is_file()
         assert public_key_path.is_file()
-        assert result["provider"]["ray_public_key"] == public_key_path.read_text(encoding="utf-8").strip()
-        assert result["provider"]["ray_public_key"].startswith("ssh-ed25519 ")
+        assert "ssh_public_key" not in result["auth"]
+        assert result["provider"]["ray_public_key_data"] == public_key_path.read_text(encoding="utf-8").strip()
+        assert result["provider"]["ray_public_key_data"].startswith("ssh-ed25519 ")
+        private_key = serialization.load_ssh_private_key(private_key_path.read_bytes(), password=None)
+        expected_public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
+        ).decode("utf-8")
+        assert result["provider"]["ray_public_key_data"] == expected_public_key
+        provider = ResearchCloudNodeProvider(result["provider"], CLUSTER_NAME)
+        assert provider._workspace_creation_options(provider.head_node_type)["optional_parameters"][
+            "ray_public_key"
+        ] == expected_public_key
 
         # A second bootstrap_config call (e.g. a repeat `ray up`) must reuse
         # the same keypair rather than generating a new, unrecognized one.
-        second_cluster_config = {"cluster_name": CLUSTER_NAME, "available_node_types": {}}
+        second_cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "available_node_types": {},
+            "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
+        }
         second_result = ResearchCloudNodeProvider.bootstrap_config(second_cluster_config)
 
         assert second_result["auth"]["ssh_private_key"] == str(private_key_path)
-        assert second_result["provider"]["ray_public_key"] == result["provider"]["ray_public_key"]
+        assert second_result["provider"]["ray_public_key_data"] == result["provider"]["ray_public_key_data"]
 
     def test_rejects_generating_a_keypair_without_a_cluster_name(self):
         cluster_config = {"available_node_types": {}}
@@ -1003,7 +1042,7 @@ class TestCreateNode:
             lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
         )
         fake_client.workspaces.create.side_effect = [
-            {"id": "ws-1", "name": "node-1", "status": "pending"},
+            {"id": "ws-1", "name": "node-1", "status": "running"},
         ]
         tags = {
             TAG_RAY_CLUSTER_NAME: CLUSTER_NAME,
@@ -1014,7 +1053,10 @@ class TestCreateNode:
         with _patched_from_env(fake_client):
             result = provider.create_node({}, tags, 1)
 
-        assert result == {"ws-1": {"id": "ws-1", "name": "node-1", "status": "pending"}}
+        assert result == {"ws-1": {"id": "ws-1", "name": "node-1", "status": "running"}}
+        assert fake_client.workspaces.build_create_payload_from_names.await_args.kwargs[
+            "optional_parameters"
+        ] == EXPECTED_OPTIONAL_PARAMETERS
 
     def test_creates_head_node_without_a_cluster_name_tag(self):
         """Neither ``ray.autoscaler._private.commands.get_or_create_head_node``
@@ -1030,7 +1072,7 @@ class TestCreateNode:
             lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
         )
         fake_client.workspaces.create.side_effect = [
-            {"id": "ws-1", "name": "node-1", "status": "pending"},
+            {"id": "ws-1", "name": "node-1", "status": "running"},
         ]
         tags = {
             TAG_RAY_USER_NODE_TYPE: "head",
@@ -1040,18 +1082,19 @@ class TestCreateNode:
         with _patched_from_env(fake_client):
             result = provider.create_node({}, tags, 1)
 
-        assert result == {"ws-1": {"id": "ws-1", "name": "node-1", "status": "pending"}}
+        assert result == {"ws-1": {"id": "ws-1", "name": "node-1", "status": "running"}}
 
-    def test_waits_for_workspace_to_leave_creating_state(self):
+    def test_waits_for_workspace_to_reach_running_state(self):
         provider = _provider(workspace_creation_timeout=30)
         creating = {"id": "ws-1", "name": "node-1", "status": "creating"}
+        pending = {"id": "ws-1", "name": "node-1", "status": "pending"}
         running = {"id": "ws-1", "name": "node-1", "status": "running"}
         fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={})
         fake_client.workspaces.build_create_payload_from_names.side_effect = (
             lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
         )
         fake_client.workspaces.create.return_value = creating
-        fake_client.workspaces.get = AsyncMock(side_effect=[creating, running])
+        fake_client.workspaces.get = AsyncMock(side_effect=[creating, pending, running])
         tags = {
             TAG_RAY_USER_NODE_TYPE: "head",
             TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
@@ -1064,8 +1107,8 @@ class TestCreateNode:
             result = provider.create_node({}, tags, 1)
 
         assert result == {"ws-1": running}
-        assert fake_client.workspaces.get.await_count == 2
-        assert sleep.await_count == 2
+        assert fake_client.workspaces.get.await_count == 3
+        assert sleep.await_count == 3
 
     def test_workspace_creation_wait_raises_after_configured_timeout(self):
         provider = _provider(workspace_creation_timeout=5)
@@ -1090,7 +1133,7 @@ class TestCreateNode:
             _patched_from_env(fake_client),
             patch("src_ray_provider.node_provider.asyncio.get_running_loop", return_value=fake_loop),
             patch("src_ray_provider.node_provider.asyncio.sleep", side_effect=advance_clock),
-            pytest.raises(TimeoutError, match="remained in 'creating' state for 5 seconds"),
+            pytest.raises(TimeoutError, match="did not reach 'running' state for 5 seconds"),
         ):
             provider.create_node({}, tags, 1)
 
@@ -1103,8 +1146,8 @@ class TestCreateNode:
             lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
         )
         fake_client.workspaces.create.side_effect = [
-            {"id": "ws-1", "name": "node-1", "status": "pending"},
-            {"id": "ws-2", "name": "node-2", "status": "pending"},
+            {"id": "ws-1", "name": "node-1", "status": "running"},
+            {"id": "ws-2", "name": "node-2", "status": "running"},
         ]
         tags = {
             TAG_RAY_CLUSTER_NAME: CLUSTER_NAME,
@@ -1139,7 +1182,7 @@ class TestCreateNode:
         )
         fake_client.workspaces.create.side_effect = [
             ApiError(400, "workspaces/", {"detail": "invalid"}),
-            {"id": "ws-2", "name": "node-2", "status": "pending"},
+            {"id": "ws-2", "name": "node-2", "status": "running"},
         ]
         tags = {
             TAG_RAY_CLUSTER_NAME: CLUSTER_NAME,
@@ -1150,7 +1193,7 @@ class TestCreateNode:
         with _patched_from_env(fake_client):
             result = provider.create_node_with_resources_and_labels({}, tags, 2, {}, {})
 
-        assert result == {"ws-2": {"id": "ws-2", "name": "node-2", "status": "pending"}}
+        assert result == {"ws-2": {"id": "ws-2", "name": "node-2", "status": "running"}}
         assert fake_client.workspaces.create.await_count == 2
 
     @pytest.mark.parametrize("count", [-1, 1.5])
