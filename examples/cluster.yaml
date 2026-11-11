@@ -26,6 +26,7 @@ auth:
 # set explicitly or `ray up` fails with a KeyError while merging commands.
 initialization_commands: []
 setup_commands: []
+head_setup_commands: []
 worker_setup_commands: []
 file_mounts: {}
 cluster_synced_files: []
@@ -46,8 +47,9 @@ worker_start_ray_commands:
 
 # Global cap on worker nodes across the whole cluster. During bootstrap, the
 # provider creates a Ray node type for each size flavour in the Ray Head Node
-# and Ray Worker catalog items. The smallest-CPU head flavour is selected by
-# default; define head_node_type / available_node_types below to override.
+# and Ray Worker catalog items before Ray validates the configuration. The
+# smallest-CPU head flavour is selected by default; define head_node_type /
+# available_node_types below to override.
 max_workers: 4
 
 idle_timeout_minutes: 10

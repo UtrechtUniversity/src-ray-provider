@@ -52,8 +52,10 @@ The `provider` block also requires `co_name` and `wallet_name`. Ray's
 flavours available for the `Ray Head Node` and `Ray Worker` catalog items on
 the configured cloud. The smallest-CPU head flavour is selected by default,
 and each generated worker node type uses the top-level `max_workers` limit.
-This catalog lookup happens during `ray up`, so `RESEARCH_CLOUD_TOKEN` must be
-available when bootstrapping the cluster.
+This catalog lookup happens before Ray validates the configuration during
+`ray up`, so `RESEARCH_CLOUD_TOKEN` must be available when bootstrapping the
+cluster. If Ray has cached an earlier configuration, use
+`ray up --no-config-cache cluster.yaml` to refresh it.
 
 You can override or extend the generated Ray configuration in cluster.yaml.
 Values you provide are merged over the generated defaults. For example, set

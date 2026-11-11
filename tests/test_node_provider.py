@@ -6,9 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 
 from cryptography.hazmat.primitives import serialization
 from ray import _version as ray_version
+from ray.autoscaler._private.commands import _bootstrap_config
 from ray.autoscaler.tags import (
     NODE_KIND_HEAD,
     NODE_KIND_WORKER,
@@ -224,6 +226,48 @@ class TestBootstrapConfig:
             lambda: FakeClient(),
         )
         monkeypatch.setattr("src_ray_provider.node_provider.cli_logger.verbose", lambda *args, **kwargs: None)
+
+    @pytest.mark.parametrize("config_path", ["cluster.yaml", "examples/cluster.yaml"])
+    def test_ray_bootstrap_validates_example_config_before_provider_bootstrap(self, config_path):
+        config = yaml.safe_load((Path(__file__).parent.parent / config_path).read_text())
+
+        result = _bootstrap_config(config, no_config_cache=True)
+
+        assert result["head_node_type"] == "head_1_core_8_gb_ram"
+        assert result["available_node_types"]["worker_4_core_16_gb"]["resources"] == {"CPU": 4}
+        assert "ray.head.default" not in result["available_node_types"]
+        assert "ray.worker.default" not in result["available_node_types"]
+        assert "_src_node_types_resolved" not in result["provider"]
+
+    def test_ray_bootstrap_merges_partial_generated_node_type_override(self):
+        config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
+        config["available_node_types"] = {"worker_4_core_16_gb": {"max_workers": 2}}
+
+        result = _bootstrap_config(config, no_config_cache=True)
+
+        assert result["head_node_type"] == "head_1_core_8_gb_ram"
+        assert result["available_node_types"]["worker_4_core_16_gb"]["max_workers"] == 2
+        assert result["available_node_types"]["worker_4_core_16_gb"]["resources"] == {"CPU": 4}
+
+    def test_ray_bootstrap_preserves_explicit_head_and_custom_node(self):
+        config = yaml.safe_load((Path(__file__).parent.parent / "cluster.yaml").read_text())
+        config["head_node_type"] = "head_2_core_8_gb"
+        config["available_node_types"] = {
+            "custom_worker": {
+                "resources": {"CPU": 8},
+                "node_config": {
+                    "catalog_item_name": "Custom Ray Worker",
+                    "size_flavour_name": "8 Core - 32 GB RAM",
+                },
+            }
+        }
+
+        result = _bootstrap_config(config, no_config_cache=True)
+
+        assert result["head_node_type"] == "head_2_core_8_gb"
+        assert result["provider"]["head_node_type"] == "head_2_core_8_gb"
+        assert result["available_node_types"]["custom_worker"]["resources"] == {"CPU": 8}
+        assert result["provider"]["node_types"]["custom_worker"]["catalog_item_name"] == "Custom Ray Worker"
 
     def test_copies_head_node_type_from_cluster_config_top_level(self):
         cluster_config = {
