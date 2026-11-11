@@ -1,3 +1,6 @@
 cluster.yaml
 uv.lock
 **/**/__pycache__
+*.egg*
+**/*.egg*
+*.vscode
