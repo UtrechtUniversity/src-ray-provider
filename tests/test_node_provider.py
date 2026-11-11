@@ -161,6 +161,51 @@ class TestBootstrapConfig:
     docstring); it derives them from the full cluster config instead.
     """
 
+    @pytest.fixture(autouse=True)
+    def mock_catalog_api(self, monkeypatch):
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                return None
+
+            async def resolve_co(self, co_name):
+                return {"id": "co-id"}
+
+            async def resolve_wallet(self, wallet_name):
+                return {"budgets": [{"products": ["product-id"]}]}
+
+            async def resolve_catalog_item(self, catalog_item_name, co_id, products):
+                return {"name": catalog_item_name}
+
+            async def resolve_offering_and_flavours(
+                self, catalog_item, co_id, products, cloud_name, os_flavour_name, size_flavour_name
+            ):
+                if catalog_item["name"] == DEFAULT_HEAD_CATALOG_ITEM_NAME:
+                    size_flavours = [
+                        "1 Core - 8 GB RAM",
+                        "2 Core - 8 GB",
+                        "GPU 4 Core - 1x A100",
+                    ]
+                else:
+                    size_flavours = [
+                        "2 Core - 8 GB",
+                        "4 Core - 16 GB",
+                        "8 Core - 32 GB RAM",
+                    ]
+                return (
+                    {"flavours": [{"category": "size", "name": name} for name in size_flavours]},
+                    None,
+                    None,
+                )
+
+        monkeypatch.setattr(
+            "src_ray_provider.node_provider.ResearchCloudClient.from_env",
+            lambda: FakeClient(),
+        )
+        monkeypatch.setattr("src_ray_provider.node_provider.cli_logger.verbose", lambda *args, **kwargs: None)
+
     def test_copies_head_node_type_from_cluster_config_top_level(self):
         cluster_config = {
             "cluster_name": CLUSTER_NAME,
@@ -172,6 +217,76 @@ class TestBootstrapConfig:
         result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
 
         assert result["provider"]["head_node_type"] == "head"
+
+    def test_generates_flavour_node_types_and_uses_smallest_cpu_head_by_default(self):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "max_workers": 4,
+            "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
+        }
+
+        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+        assert result["head_node_type"] == "head_1_core_8_gb_ram"
+        assert result["available_node_types"]["head_1_core_8_gb_ram"] == {
+            "min_workers": 0,
+            "max_workers": 0,
+            "resources": {"CPU": 1},
+            "node_config": {
+                "catalog_item_name": DEFAULT_HEAD_CATALOG_ITEM_NAME,
+                "size_flavour_name": "1 Core - 8 GB RAM",
+            },
+        }
+        assert result["available_node_types"]["head_gpu_4_core_1x_a100"]["resources"] == {
+            "CPU": 4,
+            "GPU": 1,
+        }
+        assert result["available_node_types"]["worker_4_core_16_gb"]["max_workers"] == 4
+        assert result["available_node_types"]["worker_4_core_16_gb"]["node_config"]["catalog_item_name"] == (
+            DEFAULT_WORKER_CATALOG_ITEM_NAME
+        )
+        assert result["provider"]["head_node_type"] == "head_1_core_8_gb_ram"
+
+    def test_user_config_overrides_generated_node_fields_and_can_select_custom_catalog_item(self):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "max_workers": 4,
+            "head_node_type": "head_2_core_8_gb",
+            "available_node_types": {
+                "worker_4_core_16_gb": {
+                    "max_workers": 2,
+                    "node_config": {"catalog_item_name": "Custom Ray Worker"},
+                },
+                "custom_worker": {
+                    "min_workers": 0,
+                    "max_workers": 1,
+                    "resources": {"CPU": 8},
+                    "node_config": {
+                        "catalog_item_name": "Custom Ray Worker",
+                        "size_flavour_name": "8 Core - 32 GB RAM",
+                    },
+                },
+            },
+            "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
+        }
+
+        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+        assert result["available_node_types"]["worker_4_core_16_gb"]["max_workers"] == 2
+        assert result["available_node_types"]["worker_4_core_16_gb"]["node_config"] == {
+            "catalog_item_name": "Custom Ray Worker",
+            "size_flavour_name": "4 Core - 16 GB",
+        }
+        assert result["provider"]["node_types"]["worker_4_core_16_gb"]["catalog_item_name"] == (
+            "Custom Ray Worker"
+        )
+        assert result["available_node_types"]["custom_worker"]["node_config"]["catalog_item_name"] == (
+            "Custom Ray Worker"
+        )
+        assert result["provider"]["node_types"]["custom_worker"] == {
+            "catalog_item_name": "Custom Ray Worker",
+            "size_flavour_name": "8 Core - 32 GB RAM",
+        }
 
     def test_adds_provider_installation_to_head_setup_commands(self):
         cluster_config = {
@@ -220,10 +335,51 @@ class TestBootstrapConfig:
 
         result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
 
-        assert result["provider"]["node_types"] == {
-            "head": {"size_flavour_name": "2 Core - 8 GB"},
-            "worker": {"size_flavour_name": "4 Core - 16 GB", "catalog_item_name": "Custom Worker Item"},
+        assert result["provider"]["node_types"]["head"] == {"size_flavour_name": "2 Core - 8 GB"}
+        assert result["provider"]["node_types"]["worker"] == {
+            "size_flavour_name": "4 Core - 16 GB",
+            "catalog_item_name": "Custom Worker Item",
         }
+        assert result["provider"]["node_types"]["head_1_core_8_gb_ram"] == {
+            "catalog_item_name": DEFAULT_HEAD_CATALOG_ITEM_NAME,
+            "size_flavour_name": "1 Core - 8 GB RAM",
+        }
+        assert "worker_8_core_32_gb_ram" in result["provider"]["node_types"]
+
+    def test_num_cpu_override_replaces_generated_flavour_without_duplicate_node_mapping(self):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "head_node_type": "head",
+            "available_node_types": {
+                "head": {"node_config": {"size_flavour_name": "2 Core - 8 GB"}},
+                "worker": {"node_config": {"num_cpu": 4}},
+            },
+            "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
+        }
+
+        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+        assert result["available_node_types"]["worker"]["node_config"] == {"num_cpu": 4}
+        assert "worker_4_core_16_gb" not in result["available_node_types"]
+
+    def test_num_cpu_head_override_keeps_the_smallest_head_flavour_as_default(self):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "provider": {"co_name": "Example CO", "wallet_name": "Example Wallet"},
+            "available_node_types": {
+                "custom_head": {
+                    "node_config": {
+                        "catalog_item_name": DEFAULT_HEAD_CATALOG_ITEM_NAME,
+                        "num_cpu": 1,
+                    }
+                }
+            },
+        }
+
+        result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+        assert result["head_node_type"] == "custom_head"
+        assert "head_1_core_8_gb_ram" not in result["available_node_types"]
 
     def test_does_not_override_an_explicit_provider_head_node_type(self):
         cluster_config = {

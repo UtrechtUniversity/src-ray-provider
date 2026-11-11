@@ -44,23 +44,10 @@ worker_start_ray_commands:
   - ray stop
   - ray start --address=$RAY_HEAD_IP:6379
 
-# Global cap on worker nodes across the whole cluster; the "external"
-# provider type has no default, so this must be set explicitly.
+# Global cap on worker nodes across the whole cluster. During bootstrap, the
+# provider creates a Ray node type for each size flavour in the Ray Head Node
+# and Ray Worker catalog items. The smallest-CPU head flavour is selected by
+# default; define head_node_type / available_node_types below to override.
 max_workers: 4
-
-head_node_type: head
-available_node_types:
-  head:
-    min_workers: 0
-    max_workers: 0
-    resources: {"CPU": 1}
-    node_config:
-      size_flavour_name: 1 Core - 8 GB RAM
-  worker:
-    min_workers: 0
-    max_workers: 4
-    resources: {"CPU": 2}
-    node_config:
-      num_cpu: 2
 
 idle_timeout_minutes: 10

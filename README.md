@@ -48,7 +48,37 @@ provider:
 ```
 
 The `provider` block also requires `co_name` and `wallet_name`. Ray's
-`head_node_type` and `available_node_types` are used to derive SRC sizing.
+`head_node_type` and `available_node_types` are generated from the size
+flavours available for the `Ray Head Node` and `Ray Worker` catalog items on
+the configured cloud. The smallest-CPU head flavour is selected by default,
+and each generated worker node type uses the top-level `max_workers` limit.
+This catalog lookup happens during `ray up`, so `RESEARCH_CLOUD_TOKEN` must be
+available when bootstrapping the cluster.
+
+You can override or extend the generated Ray configuration in cluster.yaml.
+Values you provide are merged over the generated defaults. For example, set
+`head_node_type` to another generated head type, tune worker limits/resources,
+or set a custom `node_config.catalog_item_name` to use a different catalog
+item:
+
+```yaml
+head_node_type: head_2_core_8_gb
+available_node_types:
+  worker_4_core_16_gb:
+    max_workers: 2
+  custom_worker:
+    min_workers: 0
+    max_workers: 1
+    resources: {"CPU": 8}
+    node_config:
+      catalog_item_name: My Custom Ray Worker
+      size_flavour_name: 8 Core - 32 GB RAM
+```
+
+Generated node type names use a lowercase `head_` or `worker_` prefix followed
+by the normalized size-flavour name. `node_config.catalog_item_name` can be
+overridden per node type; the default remains `Ray Head Node` or `Ray Worker`
+according to the generated type.
 
 **Note:** if you set `auth.ssh_private_key` and `auth.ssh_public_key` in the
 provider block to paths to those respective keys, **both keys will be uploaded to the head node**.

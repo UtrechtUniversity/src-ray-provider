@@ -24,10 +24,15 @@ duplication for avoiding any persisted/free-text tag storage:
   ``NodeProvider.__init__`` (only the ``provider:`` section and
   ``cluster_name`` are passed). Rather than requiring cluster.yaml authors
   to duplicate it manually, ``bootstrap_config`` (a hook Ray calls once
-  with the *full* cluster config, before constructing the provider; see
+  with the *full* cluster config, before constructing the provider) generates
+  node types from the size flavours in the Ray Head Node and Ray Worker
+  catalog offerings; when no top-level ``head_node_type`` is configured it
+  selects the smallest-CPU head flavour. User-provided
+  ``available_node_types`` values are merged over those generated defaults.
+  See
   ``ray.autoscaler.node_provider.NodeProvider.bootstrap_config`` and
-  ``ray.autoscaler._private.commands._bootstrap_config``) copies
-  cluster.yaml's top-level ``head_node_type`` into ``provider.head_node_type``
+  ``ray.autoscaler._private.commands._bootstrap_config``. It copies the
+  resulting top-level ``head_node_type`` into ``provider.head_node_type``
   automatically. Likewise, ``provider.node_types`` is auto-derived from
   each node type's ``available_node_types.<type>.node_config`` — the same
   place Ray's own providers read provider-specific per-node-type settings
@@ -107,7 +112,7 @@ from researchcloud.client import ResearchCloudClient
 from researchcloud.config import DEFAULT_CLOUD_NAME
 from researchcloud.errors import ApiError
 from researchcloud.services import is_workspace_terminal_status
-from researchcloud.utils.flavours import match_size_flavour, validate_size_flavour_selection
+from researchcloud.utils.flavours import match_size_flavour, parse_size_flavour, validate_size_flavour_selection
 
 
 DEFAULT_HEAD_CATALOG_ITEM_NAME = "Ray Head Node"
@@ -139,6 +144,217 @@ def deep_merge(base: dict, override: dict) -> dict:
         else:
             out[key] = copy.deepcopy(val)
     return out
+
+
+def _size_flavour_resources(name: str) -> dict[str, int] | None:
+    """Translate the SDK's parsed flavour metadata into Ray resources."""
+    metadata = parse_size_flavour(name)
+    cpu, gpu = metadata["cpu"], metadata["gpu"]
+    if cpu is None or cpu < 1:
+        return None
+
+    resources = {"CPU": cpu}
+    if gpu is not None and gpu > 0:
+        resources["GPU"] = gpu
+    return resources
+
+
+async def _catalog_node_types(
+    provider_config: Mapping[str, Any],
+    max_workers: int,
+) -> tuple[dict[str, Any], str]:
+    """Load head/worker node types and choose the smallest-CPU head flavour."""
+    co_name = provider_config.get("co_name")
+    wallet_name = provider_config.get("wallet_name")
+    if not isinstance(co_name, str) or not co_name.strip():
+        raise ValueError("provider config must include a non-empty 'co_name' to load catalog flavours")
+    if not isinstance(wallet_name, str) or not wallet_name.strip():
+        raise ValueError("provider config must include a non-empty 'wallet_name' to load catalog flavours")
+
+    cloud_name = provider_config.get("cloud_name", DEFAULT_CLOUD_NAME)
+    os_flavour_name = provider_config.get("os_flavour_name", DEFAULT_OS_FLAVOUR_NAME)
+    generated: dict[str, Any] = {}
+    generated_head_types: list[tuple[int, int, str, str]] = []
+
+    async with ResearchCloudClient.from_env() as client:
+        co = await client.resolve_co(co_name)
+        wallet = await client.resolve_wallet(wallet_name)
+        budgets = wallet.get("budgets")
+        if not isinstance(budgets, list) or not budgets or not isinstance(budgets[0], Mapping):
+            raise ValueError(f"ResearchCloud wallet {wallet_name!r} has no usable budget")
+        products = budgets[0].get("products")
+        if not isinstance(products, list) or not products:
+            raise ValueError(f"ResearchCloud wallet {wallet_name!r} has no products available")
+
+        for role, catalog_item_name in (
+            ("head", DEFAULT_HEAD_CATALOG_ITEM_NAME),
+            ("worker", DEFAULT_WORKER_CATALOG_ITEM_NAME),
+        ):
+            catalog_item = await client.resolve_catalog_item(catalog_item_name, co["id"], products)
+            offering, _, _ = await client.resolve_offering_and_flavours(
+                catalog_item,
+                co["id"],
+                products,
+                cloud_name,
+                os_flavour_name,
+                None,
+            )
+            size_flavours = [
+                flavour for flavour in offering.get("flavours", []) if flavour.get("category") == "size"
+            ]
+            valid_count = 0
+            for flavour in size_flavours:
+                flavour_name = flavour.get("name")
+                if not isinstance(flavour_name, str) or not flavour_name.strip():
+                    logger.warning("Skipping unnamed size flavour in %s catalog item", catalog_item_name)
+                    continue
+                resources = _size_flavour_resources(flavour_name)
+                if resources is None:
+                    logger.warning(
+                        "Skipping size flavour %r from %s because its CPU count could not be parsed",
+                        flavour_name,
+                        catalog_item_name,
+                    )
+                    continue
+
+                node_type = f"{role}_{re.sub(r'[^a-z0-9]+', '_', flavour_name.lower()).strip('_')}"
+                if node_type in generated:
+                    raise ValueError(
+                        f"size flavour names in {catalog_item_name!r} produce duplicate Ray node type "
+                        f"name {node_type!r}"
+                    )
+                generated[node_type] = {
+                    "min_workers": 0,
+                    "max_workers": 0 if role == "head" else max_workers,
+                    "resources": resources,
+                    "node_config": {
+                        "catalog_item_name": catalog_item_name,
+                        "size_flavour_name": flavour_name,
+                    },
+                }
+                valid_count += 1
+                if role == "head":
+                    generated_head_types.append(
+                        (resources["CPU"], resources.get("GPU", 0), flavour_name, node_type)
+                    )
+            if not valid_count:
+                raise ValueError(
+                    f"No usable CPU size flavours found for {catalog_item_name!r} on cloud {cloud_name!r}"
+                )
+
+    head_node_type = min(generated_head_types)[3]
+    return generated, head_node_type
+
+
+def _catalog_flavours_by_item(generated: Mapping[str, Any]) -> dict[str, list[dict[str, str]]]:
+    """Index generated flavour names in the shape expected by the SDK matcher."""
+    flavours: dict[str, list[dict[str, str]]] = {}
+    for node in generated.values():
+        config = node["node_config"]
+        flavours.setdefault(config["catalog_item_name"], []).append(
+            {"category": "size", "name": config["size_flavour_name"]}
+        )
+    return flavours
+
+
+def _node_catalog_flavour(
+    name: str,
+    config: Mapping[str, Any],
+    head_node_type: str,
+    flavours_by_item: Mapping[str, list[dict[str, str]]],
+) -> tuple[str, str] | None:
+    """Resolve a node's catalog/flavour identity, including CPU/GPU selectors."""
+    node_config = config.get("node_config", {})
+    if not isinstance(node_config, Mapping):
+        return None
+
+    catalog_name = node_config.get(
+        "catalog_item_name",
+        DEFAULT_HEAD_CATALOG_ITEM_NAME if name == head_node_type else DEFAULT_WORKER_CATALOG_ITEM_NAME,
+    )
+    flavour_name = node_config.get("size_flavour_name")
+    if (
+        flavour_name is None
+        and catalog_name in flavours_by_item
+        and (node_config.get("num_cpu") is not None or node_config.get("num_gpu") is not None)
+    ):
+        flavour_name = match_size_flavour(
+            flavours_by_item[catalog_name],
+            num_cpu=node_config.get("num_cpu"),
+            num_gpu=node_config.get("num_gpu"),
+            gpu_type=node_config.get("gpu_type"),
+        )["name"]
+    if not isinstance(catalog_name, str) or not isinstance(flavour_name, str):
+        return None
+    return catalog_name, flavour_name
+
+
+def _merge_node_config_overrides(
+    available: dict[str, Any],
+    user_node_types: Mapping[str, Any],
+) -> None:
+    """When sizing is overridden, discard inherited selectors to avoid conflicting strategies."""
+    sizing_keys = ("size_flavour_name", "num_cpu", "num_gpu", "gpu_type")
+    for name, config in user_node_types.items():
+        overrides = config.get("node_config", {}) if isinstance(config, Mapping) else {}
+        if not isinstance(overrides, Mapping) or not any(key in overrides for key in sizing_keys[:3]):
+            continue
+        node_config = available[name].get("node_config")
+        if isinstance(node_config, dict):
+            for key in sizing_keys:
+                if key not in overrides:
+                    node_config.pop(key, None)
+
+
+def _merge_catalog_node_types(
+    generated: dict[str, Any],
+    user_node_types: Mapping[str, Any],
+    default_head_node_type: str,
+    head_node_type: str | None,
+) -> tuple[dict[str, Any], str]:
+    """Merge user overrides, deduplicate SRC identities, and return the default head type.
+
+    Ray node types must resolve to unique (catalog item, size flavour) pairs
+    because workspace discovery reverse-maps that pair to one Ray type.
+    Explicit YAML entries take precedence over generated entries with a matching pair.
+    """
+    available = deep_merge(generated, dict(user_node_types))
+    _merge_node_config_overrides(available, user_node_types)
+    selected_head = default_head_node_type if head_node_type is None else head_node_type
+    flavours_by_item = _catalog_flavours_by_item(generated)
+    configured_pairs: dict[tuple[str, str], str] = {}
+
+    for name, config in list(available.items()):
+        pair = _node_catalog_flavour(name, config, selected_head, flavours_by_item)
+        if pair is None:
+            continue
+
+        # A custom name can replace a generated entry, but identical custom
+        # entries remain an error to be reported by the provider's validation.
+        previous = configured_pairs.get(pair)
+        if previous is not None and name in user_node_types and previous not in user_node_types:
+            available.pop(previous)
+            configured_pairs[pair] = name
+        elif previous is not None and previous in user_node_types and name not in user_node_types:
+            available.pop(name)
+        else:
+            configured_pairs[pair] = name
+
+    if head_node_type is None:
+        head_config = generated[default_head_node_type]["node_config"]
+        head_pair = (head_config["catalog_item_name"], head_config["size_flavour_name"])
+        head_node_type = configured_pairs.get(head_pair, default_head_node_type)
+    return available, head_node_type
+
+
+def _provider_node_types(available_node_types: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    keys = ("size_flavour_name", "num_cpu", "num_gpu", "gpu_type", "catalog_item_name")
+    node_types = {}
+    for name, config in available_node_types.items():
+        node_config = config.get("node_config", {}) if isinstance(config, Mapping) else {}
+        node_types[name] = {key: node_config[key] for key in keys if key in node_config}
+    return node_types
+
 
 @contextlib.contextmanager
 def _locked_cache_file(lock_path: Path):
@@ -268,9 +484,9 @@ class ResearchCloudNodeProvider(NodeProvider):
         cluster_config = deep_merge(defaults, cluster_config)
 
         provider_config = cluster_config.setdefault("provider", {})
-        provider_config.setdefault("head_node_type", cluster_config.get("head_node_type"))
-
         auth_config = cluster_config["auth"]
+        if not isinstance(auth_config, dict):
+            raise ValueError("cluster config 'auth' must be a mapping")
 
         public_key = auth_config.get("ssh_public_key")
         private_key = auth_config.get("ssh_private_key")
@@ -313,17 +529,24 @@ class ResearchCloudNodeProvider(NodeProvider):
         )
         auth_config.pop("ssh_public_key")
 
+        generated_node_types, default_head_node_type = asyncio.run(
+            _catalog_node_types(provider_config, cluster_config.get("max_workers", 0))
+        )
+        user_node_types = cluster_config.get("available_node_types", {})
+        if not isinstance(user_node_types, Mapping):
+            raise ValueError("cluster config 'available_node_types' must be a mapping")
+        available_node_types, default_head_node_type = _merge_catalog_node_types(
+            generated_node_types,
+            user_node_types,
+            default_head_node_type,
+            cluster_config.get("head_node_type"),
+        )
+        cluster_config.setdefault("head_node_type", default_head_node_type)
+        cluster_config["available_node_types"] = available_node_types
+        provider_config.setdefault("head_node_type", cluster_config.get("head_node_type"))
+
         if "node_types" not in provider_config:
-            derived_node_types: dict[str, dict[str, Any]] = {}
-            for node_type, node_type_config in cluster_config.get("available_node_types", {}).items():
-                node_config = node_type_config.get("node_config", {}) if isinstance(node_type_config, Mapping) else {}
-                derived_node_type: dict[str, Any] = {
-                    key: node_config[key]
-                    for key in ("size_flavour_name", "num_cpu", "num_gpu", "gpu_type", "catalog_item_name")
-                    if key in node_config
-                }
-                derived_node_types[node_type] = derived_node_type
-            provider_config["node_types"] = derived_node_types
+            provider_config["node_types"] = _provider_node_types(available_node_types)
 
         return cluster_config
 
