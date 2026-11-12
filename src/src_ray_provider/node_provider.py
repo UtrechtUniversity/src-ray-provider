@@ -1022,7 +1022,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         eventually, node creation (section 4).
         """
         suffix = uuid.uuid4().hex[:8]
-        sanitized_node_type = sanitize_name_component(node_type)
+        sanitized_node_type = "head" if "head" in node_type else "worker"
         base = f"{self._cluster_prefix}{sanitized_node_type}-"
         max_base_length = _WORKSPACE_NAME_MAX_LENGTH - len(suffix)
         if len(base) > max_base_length:
