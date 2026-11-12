@@ -694,11 +694,11 @@ class ResearchCloudNodeProvider(NodeProvider):
         }
 
         options["optional_parameters"] = {
-            "ray_public_key": self.ray_public_key_data,
-            "ray_do_setup": "false",
-            "ray_version": ray_version.version,
-            "ray_python_version": platform.python_version(),
-            "ray_packages": "default", # todo: make this configurable
+            "public_key": self.ray_public_key_data,
+            "do_setup": "false",
+            "version": ray_version.version,
+            "python_version": platform.python_version(),
+            "packages": "default,client,train,tune,serve", # todo: make this configurable
         }
         return options
 

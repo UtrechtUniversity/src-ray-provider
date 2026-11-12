@@ -50,11 +50,11 @@ CLUSTER_NAME = "test-cluster"
 CLUSTER_PREFIX = f"ray-{CLUSTER_NAME}-"
 PUBLIC_KEY = "ssh-ed25519 AAAAfake test@example"
 EXPECTED_OPTIONAL_PARAMETERS = {
-    "ray_public_key": PUBLIC_KEY,
-    "ray_do_setup": "false",
-    "ray_version": ray_version.version,
-    "ray_python_version": platform.python_version(),
-    "ray_packages": "default",
+    "public_key": PUBLIC_KEY,
+    "do_setup": "false",
+    "version": ray_version.version,
+    "python_version": platform.python_version(),
+    "packages": "default,client,train,tune,serve",
 }
 
 
