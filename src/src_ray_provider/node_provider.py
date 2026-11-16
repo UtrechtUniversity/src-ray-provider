@@ -45,7 +45,8 @@ duplication for avoiding any persisted/free-text tag storage:
   namespace, it is simply ``self.cluster_name`` for any workspace that
   belongs to this cluster. Cluster membership is determined by a naming
   convention applied when a workspace is created: its ``name`` is prefixed
-  with ``ray-{cluster_name}-`` (sanitized to fit SRC's naming rules).
+  with ``ray-{cluster_name}-`` (sanitized to fit SRC's naming rules). An
+  existing head workspace can instead be identified by ``head_workspace_id``.
 
 Mutable Ray tags (notably ``TAG_RAY_LAUNCH_CONFIG``, written once at node
 creation and read back by ``ray up``/the autoscaler on every subsequent
@@ -629,6 +630,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             provider_config, "os_flavour_name", default=DEFAULT_OS_FLAVOUR_NAME
         )
         self.network_name_hint = self._config_value(provider_config, "network_name_hint", optional=True)
+        self.head_workspace_id = self._config_value(provider_config, "head_workspace_id", optional=True)
         self.ray_public_key_data = self._config_value(provider_config, "ray_public_key_data")
 
         self.workspace_creation_timeout = self._timeout_value(
@@ -988,6 +990,19 @@ class ResearchCloudNodeProvider(NodeProvider):
     def _kind_for_node_type(self, node_type: str) -> str:
         return NODE_KIND_HEAD if node_type == self.head_node_type else NODE_KIND_WORKER
 
+    def _validate_head_workspace(self, workspace: Mapping[str, Any]) -> None:
+        workspace_id = self._workspace_id(workspace)
+        status = self._workspace_status(workspace)
+        if is_workspace_terminal_status(status):
+            raise ValueError(f"configured head workspace {workspace_id!r} has terminal status {status!r}")
+        node_type = self._node_type_for_workspace(workspace)
+        if node_type != self.head_node_type:
+            raise ValueError(
+                f"configured head workspace {workspace_id!r} has catalog item and size flavour "
+                f"that do not match head node type {self.head_node_type!r} "
+                f"(resolved node type: {node_type!r})"
+            )
+
     def _node_tags_for_workspace(self, workspace: Mapping[str, Any]) -> dict[str, str]:
         """Derive this workspace's static Ray tags from queryable fields only.
 
@@ -999,6 +1014,8 @@ class ResearchCloudNodeProvider(NodeProvider):
         out-of-band after creation).
         """
         tags = {TAG_RAY_CLUSTER_NAME: self.cluster_name}
+        if self.head_workspace_id is not None and workspace.get("id") == self.head_workspace_id:
+            self._validate_head_workspace(workspace)
         node_type = self._node_type_for_workspace(workspace)
         if node_type is not None:
             tags[TAG_RAY_USER_NODE_TYPE] = node_type
@@ -1006,13 +1023,13 @@ class ResearchCloudNodeProvider(NodeProvider):
         return tags
 
     def _belongs_to_cluster(self, workspace: Mapping[str, Any]) -> bool:
-        """Return whether a workspace's name marks it as managed by this cluster.
+        """Return whether a workspace belongs to this cluster.
 
-        A ``NodeProvider`` only ever operates within its own
-        ``cluster_name`` namespace, so this is a prefix check against the
-        naming convention applied at creation time (``_workspace_name_for``)
-        rather than an attempt to parse an arbitrary cluster name back out.
+        The configured head ID bypasses the name-prefix requirement; all
+        other workspaces use the creation-time naming convention.
         """
+        if self.head_workspace_id is not None and workspace.get("id") == self.head_workspace_id:
+            return True
         name = workspace.get("name")
         return isinstance(name, str) and name.startswith(self._cluster_prefix)
 
@@ -1049,8 +1066,8 @@ class ResearchCloudNodeProvider(NodeProvider):
             co = await client.resolve_co(self.co_name)
             # Node types can use distinct catalog items per role (head vs.
             # worker), so no single catalog_item_name can be used to filter
-            # server-side; cluster membership is instead established by the
-            # workspace name prefix via _belongs_to_cluster().
+            # server-side; cluster membership is established by the workspace
+            # name prefix or configured head ID via _belongs_to_cluster().
             return await client.workspaces.list(
                 co_id=co["id"],
                 catalog_item_name="",
@@ -1092,6 +1109,26 @@ class ResearchCloudNodeProvider(NodeProvider):
             workspace_id = self._workspace_id(workspace)
             self._workspace_status(workspace)
             current_workspaces[workspace_id] = workspace
+
+        if self.head_workspace_id is not None:
+            head = current_workspaces.get(self.head_workspace_id)
+            if head is None:
+                raise ValueError(
+                    f"configured head workspace {self.head_workspace_id!r} was not found "
+                    f"in the accessible Compute workspaces for CO {self.co_name!r}"
+                )
+            self._validate_head_workspace(head)
+            for workspace_id, workspace in current_workspaces.items():
+                if (
+                    workspace_id != self.head_workspace_id
+                    and not is_workspace_terminal_status(self._workspace_status(workspace))
+                    and self._belongs_to_cluster(workspace)
+                    and self._node_type_for_workspace(workspace) == self.head_node_type
+                ):
+                    raise ValueError(
+                        f"workspace {workspace_id!r} also resolves to head node type "
+                        f"{self.head_node_type!r}; configured head workspace is {self.head_workspace_id!r}"
+                    )
 
         with self._workspaces_lock:
             self._workspaces = current_workspaces

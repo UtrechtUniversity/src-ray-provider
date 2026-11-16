@@ -12,6 +12,8 @@ import yaml
 from cryptography.hazmat.primitives import serialization
 from ray import _version as ray_version
 from ray.autoscaler._private.commands import _bootstrap_config, _set_up_config_for_head_node
+from ray.autoscaler._private.node_provider_availability_tracker import NodeAvailabilitySummary
+from ray.autoscaler._private.resource_demand_scheduler import ResourceDemandScheduler
 from ray.autoscaler.tags import (
     NODE_KIND_HEAD,
     NODE_KIND_WORKER,
@@ -109,6 +111,12 @@ def test_provider_configuration_allows_overrides():
         "network_name_hint": "ray-private",
         "optional_parameters": EXPECTED_OPTIONAL_PARAMETERS,
     }
+
+
+@pytest.mark.parametrize("value", ["", "  ", 42, False])
+def test_head_workspace_id_must_be_a_non_empty_string_when_present(value):
+    with pytest.raises(ValueError, match="head_workspace_id"):
+        ResearchCloudNodeProvider(_provider_config(head_workspace_id=value), CLUSTER_NAME)
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True, "30"])
@@ -252,6 +260,17 @@ class TestBootstrapConfig:
         assert result["head_node_type"] == "head"
         assert result["available_node_types"]["worker_4_core_16_gb"]["max_workers"] == 2
         assert result["available_node_types"]["worker_4_core_16_gb"]["resources"] == {"CPU": 4}
+
+    def test_ray_bootstrap_preserves_explicit_head_workspace_id(self):
+        config = yaml.safe_load((Path(__file__).parent.parent / "cluster.yaml").read_text())
+        config["provider"]["head_workspace_id"] = "manual-workspace-id"
+
+        result = _bootstrap_config(config, no_config_cache=True)
+
+        assert result["provider"]["head_workspace_id"] == "manual-workspace-id"
+        assert ResearchCloudNodeProvider(result["provider"], result["cluster_name"]).head_workspace_id == (
+            "manual-workspace-id"
+        )
 
     def test_autoscaler_config_contains_only_one_default_head_type(self):
         config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
@@ -956,6 +975,124 @@ class TestNonTerminatedNodes:
 
         with _patched_from_env(fake_client):
             assert provider.non_terminated_nodes({TAG_RAY_USER_NODE_TYPE: "worker"}) == []
+
+
+class TestExplicitHeadWorkspace:
+    def test_discovers_head_by_id_and_workers_by_name_with_tag_filters(self):
+        provider = _provider(head_workspace_id="ws-head")
+        head = _head_workspace("ws-head", name="ray head autoscaling")
+        head["resource_meta"]["local_ip"] = "10.10.10.103"
+        worker = _worker_workspace("ws-worker")
+        other = _worker_workspace("ws-other", name="unrelated")
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[head, worker, other])
+
+        with _patched_from_env(fake_client):
+            assert provider.non_terminated_nodes({}) == ["ws-head", "ws-worker"]
+            assert provider.non_terminated_nodes({TAG_RAY_NODE_KIND: NODE_KIND_HEAD}) == ["ws-head"]
+            assert provider.non_terminated_nodes({TAG_RAY_USER_NODE_TYPE: "head"}) == ["ws-head"]
+            assert provider.non_terminated_nodes({TAG_RAY_CLUSTER_NAME: CLUSTER_NAME}) == ["ws-head", "ws-worker"]
+            assert provider.non_terminated_nodes({TAG_RAY_NODE_KIND: NODE_KIND_WORKER}) == ["ws-worker"]
+            assert provider.node_tags("ws-head") == {
+                TAG_RAY_CLUSTER_NAME: CLUSTER_NAME,
+                TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
+                TAG_RAY_USER_NODE_TYPE: "head",
+            }
+            assert provider.internal_ip("ws-head") == "10.10.10.103"
+
+        fake_client.workspaces.list.assert_awaited_with(
+            co_id="co-1", catalog_item_name="", application_type="Compute"
+        )
+
+    def test_head_resources_are_counted_and_only_worker_is_requested(self):
+        provider = _provider(head_workspace_id="ws-head")
+        head = _head_workspace("ws-head", name="ray head autoscaling")
+        head["resource_meta"]["local_ip"] = "10.10.10.103"
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+        node_types = {
+            "head": {"min_workers": 0, "max_workers": 0, "resources": {}},
+            "worker": {"min_workers": 0, "max_workers": 6, "resources": {"CPU": 2}},
+        }
+
+        with _patched_from_env(fake_client):
+            nodes = provider.non_terminated_nodes({})
+            scheduler = ResourceDemandScheduler(provider, node_types, 6, "head", 1)
+            launches, unfulfilled = scheduler.get_nodes_to_launch(
+                nodes, {}, [{"CPU": 0.5}] * 3, {"10.10.10.103": {}},
+                [], {"10.10.10.103": {}}, [], NodeAvailabilitySummary({}),
+            )
+
+        assert launches == {"worker": 1}
+        assert unfulfilled == []
+
+    def test_matching_name_is_not_reported_twice_and_derived_tags_override_cache(self):
+        provider = _provider(head_workspace_id="ws-head")
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[_head_workspace("ws-head")])
+        with _patched_from_env(fake_client):
+            provider.set_node_tags("ws-head", {TAG_RAY_NODE_KIND: NODE_KIND_WORKER, TAG_RAY_USER_NODE_TYPE: "worker"})
+            assert provider.non_terminated_nodes({TAG_RAY_NODE_KIND: NODE_KIND_HEAD}) == ["ws-head"]
+            assert provider.node_tags("ws-head")[TAG_RAY_NODE_KIND] == NODE_KIND_HEAD
+            assert provider.node_tags("ws-head")[TAG_RAY_USER_NODE_TYPE] == "head"
+
+    def test_missing_or_inaccessible_head_fails_instead_of_launching_a_replacement(self):
+        provider = _provider(head_workspace_id="missing")
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[_worker_workspace("ws-worker")])
+        with _patched_from_env(fake_client), pytest.raises(ValueError, match="missing.*not found.*CO"):
+            provider.non_terminated_nodes({})
+
+    def test_terminal_head_fails(self):
+        provider = _provider(head_workspace_id="ws-head")
+        fake_client = _FakeClient(
+            co={"id": "co-1"}, workspaces=[_head_workspace("ws-head", status="deleted", name="manual")]
+        )
+        with _patched_from_env(fake_client), pytest.raises(ValueError, match="ws-head.*terminal.*deleted"):
+            provider.non_terminated_nodes({})
+
+    @pytest.mark.parametrize(
+        "head",
+        [
+            _worker_workspace("ws-head", name="manual"),
+            _workspace(id="ws-head", status="running", name="manual"),
+            _workspace(
+                id="ws-head", status="running", name="manual",
+                catalog_item_name=DEFAULT_HEAD_CATALOG_ITEM_NAME, flavor_name="wrong flavour",
+            ),
+        ],
+    )
+    def test_mismatched_or_missing_head_metadata_fails(self, head):
+        provider = _provider(head_workspace_id="ws-head")
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+        with _patched_from_env(fake_client), pytest.raises(ValueError, match="ws-head.*do not match.*head"):
+            provider.non_terminated_nodes({})
+
+    def test_another_active_head_in_the_cluster_is_an_error(self):
+        provider = _provider(head_workspace_id="manual")
+        fake_client = _FakeClient(
+            co={"id": "co-1"},
+            workspaces=[_head_workspace("manual", name="manual"), _head_workspace("duplicate")],
+        )
+        with _patched_from_env(fake_client), pytest.raises(ValueError, match="duplicate.*also resolves.*manual"):
+            provider.non_terminated_nodes({})
+
+    def test_terminal_or_unrelated_head_does_not_conflict(self):
+        provider = _provider(head_workspace_id="manual")
+        fake_client = _FakeClient(
+            co={"id": "co-1"},
+            workspaces=[
+                _head_workspace("manual", name="manual"),
+                _head_workspace("old", status="deleted"),
+                _head_workspace("other", name="unrelated"),
+            ],
+        )
+        with _patched_from_env(fake_client):
+            assert provider.non_terminated_nodes({}) == ["manual"]
+
+    def test_identity_validation_also_applies_to_direct_tag_lookup(self):
+        provider = _provider(head_workspace_id="ws-head")
+        fake_client = _FakeClient(
+            co={"id": "co-1"}, workspaces=[], get_by_id={"ws-head": _worker_workspace("ws-head", name="manual")}
+        )
+        with _patched_from_env(fake_client), pytest.raises(ValueError, match="ws-head.*do not match"):
+            provider.node_tags("ws-head")
 
 
 class TestNodeTags:

@@ -85,6 +85,47 @@ followed by the normalized size-flavour name. `node_config.catalog_item_name`
 can be overridden per node type; the default remains `Ray Head Node` or
 `Ray Worker` according to the generated type.
 
+### Using an existing head workspace
+
+When starting Ray manually on an existing ResearchCloud head workspace, set
+`provider.head_workspace_id` to its ResearchCloud workspace ID (not its name,
+hostname, Ray node ID, or IP address):
+
+```yaml
+cluster_name: my-unique-cluster
+provider:
+  type: external
+  module: src_ray_provider.node_provider.ResearchCloudNodeProvider
+  co_name: Example CO
+  wallet_name: Example Wallet
+  head_workspace_id: "<ResearchCloud workspace ID>"
+head_node_type: head
+available_node_types:
+  head:
+    min_workers: 0
+    max_workers: 0
+```
+
+The workspace can have any name, but must be a non-terminal Compute workspace
+visible in the configured CO. Its catalog item and size flavour must match
+the selected head type in `provider.node_types`; choose the matching
+`head_node_type` when the default head flavour is different. Its private IP
+must match the address used to start the Ray head. A missing or mismatched
+head, or another active workspace in this cluster resolving to the head type,
+causes discovery to fail rather than launching a replacement. Without
+`head_workspace_id`, existing name-based discovery remains unchanged.
+Set the ID before starting the autoscaler; restart it when changing this
+provider setting because the provider instance is not recreated on config reload.
+
+Workers still use the `ray-<sanitized cluster_name>-` workspace name prefix.
+Choose a unique, stable `cluster_name` for each cluster, since the provider
+manages and can delete workspaces matching that prefix. Setting the head ID
+does not protect the head from explicit termination (for example, `ray down`).
+Keep the configured head resources consistent with the resources advertised by
+`ray start`, and ensure the bootstrapped SSH key and config are accessible to
+the head's autoscaler. Unlike `ray up`, manually starting the head does not
+copy these files.
+
 Set `auth.ssh_private_key` and `auth.ssh_public_key` together to paths to a
 private key and its matching public key, or leave both unset to generate and
 reuse a dedicated keypair for the cluster. Ray copies the private key to the
