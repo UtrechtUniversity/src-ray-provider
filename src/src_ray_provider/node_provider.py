@@ -243,8 +243,9 @@ async def _catalog_node_types(
                     f"No usable CPU size flavours found for {catalog_item_name!r} on cloud {cloud_name!r}"
                 )
 
-    head_node_type = min(generated_head_types)[3]
-    return generated, head_node_type
+    smallest_head_type = min(generated_head_types)[3]
+    generated["head"] = generated.pop(smallest_head_type)
+    return generated, "head"
 
 
 def _catalog_flavours_by_item(generated: Mapping[str, Any]) -> dict[str, list[dict[str, str]]]:
