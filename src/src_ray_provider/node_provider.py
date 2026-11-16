@@ -3,8 +3,8 @@
 This slice discovers workspaces as Ray nodes and derives their static,
 creation-time tags (node kind, user node type, cluster name) entirely from
 queryable workspace fields — no tag data is persisted in the workspace
-itself. Node creation and SSH address lookup are supported; mutable tag
-storage is not needed, and termination delegates to the workspace delete API.
+itself. Node creation and SSH address lookup are supported; mutable tags
+are cached locally, and termination delegates to the workspace delete API.
 
 Static tag derivation works as follows, trading a small amount of config
 duplication for avoiding any persisted/free-text tag storage:
@@ -648,6 +648,8 @@ class ResearchCloudNodeProvider(NodeProvider):
         self._workspaces: dict[str, dict[str, Any]] = {}
         self._workspaces_lock = threading.RLock()
         self._node_tag_cache = _NodeTagCache(cluster_name, NODE_TAG_CACHE_DIR)
+        self._creation_lock = threading.RLock()
+        self._creation_lock_path = NODE_TAG_CACHE_DIR / f"{sanitize_name_component(cluster_name)}.creation.lock"
 
     @staticmethod
     def _config_value(
@@ -765,12 +767,11 @@ class ResearchCloudNodeProvider(NodeProvider):
             )
 
         del node_config, resources, labels
-        created = asyncio.run(self._create_nodes(node_type, count))
-        for workspace_id in created:
-            self._node_tag_cache.update(workspace_id, tags)
-        return created
+        return asyncio.run(self._create_nodes(node_type, count, tags))
 
-    async def _create_nodes(self, node_type: str, count: int) -> Dict[str, Dict[str, Any]]:
+    async def _create_nodes(
+        self, node_type: str, count: int, tags: Mapping[str, str]
+    ) -> Dict[str, Dict[str, Any]]:
         created: Dict[str, Dict[str, Any]] = {}
         async with ResearchCloudClient.from_env() as client:
             for _ in range(count):
@@ -788,7 +789,11 @@ class ResearchCloudNodeProvider(NodeProvider):
                     plan.payload,
                 )
                 try:
-                    workspace = await client.workspaces.create(plan.payload)
+                    # Do not let discovery see the workspace before its launch tags are cached.
+                    with self._creation_lock, _locked_cache_file(self._creation_lock_path):
+                        workspace = await client.workspaces.create(plan.payload)
+                        workspace_id = self._workspace_id(workspace)
+                        self._node_tag_cache.update(workspace_id, tags)
                 except ApiError as exc:
                     logger.error(
                         "Failed to create SRC workspace %r for Ray node type %r (HTTP %s): %s",
@@ -799,7 +804,6 @@ class ResearchCloudNodeProvider(NodeProvider):
                     )
                     continue
 
-                workspace_id = self._workspace_id(workspace)
                 workspace = await self._wait_for_workspace_creation(client, workspace_id, workspace)
                 created[workspace_id] = workspace
         return created
@@ -1103,7 +1107,8 @@ class ResearchCloudNodeProvider(NodeProvider):
         return workspace
 
     def non_terminated_nodes(self, tag_filters: Dict[str, str]) -> List[str]:
-        workspaces = asyncio.run(self._list_workspaces())
+        with self._creation_lock, _locked_cache_file(self._creation_lock_path):
+            workspaces = asyncio.run(self._list_workspaces())
         current_workspaces: dict[str, dict[str, Any]] = {}
         for workspace in workspaces:
             workspace_id = self._workspace_id(workspace)

@@ -143,7 +143,12 @@ provider:
 ```
 
 The provider checks every five seconds and raises a timeout error if the
-workspace does not reach `running` within this limit.
+workspace does not reach `running` within this limit. Launch tags are cached
+as soon as SRC returns the workspace ID, before the wait. Discovery and
+workspace submission are coordinated on the same machine/account so Ray
+does not see a newly submitted workspace before its launch tags are saved.
+The cache and coordination are local: Ray commands on different machines or
+accounts do not share the tags.
 
 ## Development
 

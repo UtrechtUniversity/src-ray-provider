@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import platform
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -11,9 +13,11 @@ import yaml
 
 from cryptography.hazmat.primitives import serialization
 from ray import _version as ray_version
+from ray.autoscaler._private.autoscaler import StandardAutoscaler
 from ray.autoscaler._private.commands import _bootstrap_config, _set_up_config_for_head_node
 from ray.autoscaler._private.node_provider_availability_tracker import NodeAvailabilitySummary
 from ray.autoscaler._private.resource_demand_scheduler import ResourceDemandScheduler
+from ray.autoscaler._private.util import hash_launch_conf
 from ray.autoscaler.tags import (
     NODE_KIND_HEAD,
     NODE_KIND_WORKER,
@@ -1260,6 +1264,133 @@ class TestNodeAddresses:
 
 
 class TestCreateNode:
+    @pytest.mark.parametrize("separate_provider", [False, True])
+    def test_discovery_cannot_observe_workspace_before_create_returns(self, separate_provider):
+        provider = _provider()
+        discovery_provider = _provider() if separate_provider else provider
+        workspaces = []
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=workspaces)
+        fake_client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        )
+        workspace_visible = threading.Event()
+        continue_submission = threading.Event()
+        discovery_started = threading.Event()
+
+        async def create_workspace(payload):
+            workspace = _worker_workspace("ws-1", status="running", name=payload["name"])
+            workspaces.append(workspace)
+            workspace_visible.set()
+            if not continue_submission.wait(timeout=10):
+                raise TimeoutError("test did not release workspace submission")
+            return workspace.copy()
+
+        fake_client.workspaces.create.side_effect = create_workspace
+        config = {"auth": {}, "available_node_types": {"worker": {"node_config": {}}}}
+        tags = {
+            TAG_RAY_USER_NODE_TYPE: "worker",
+            TAG_RAY_NODE_KIND: NODE_KIND_WORKER,
+            TAG_RAY_LAUNCH_CONFIG: hash_launch_conf({}, config["auth"]),
+        }
+        autoscaler = SimpleNamespace(
+            provider=discovery_provider,
+            disable_launch_config_check=False,
+            available_node_types=config["available_node_types"],
+            config=config,
+        )
+
+        def discover():
+            discovery_started.set()
+            return {
+                node_id: StandardAutoscaler.launch_config_ok(autoscaler, node_id)
+                for node_id in discovery_provider.non_terminated_nodes({})
+            }
+
+        with _patched_from_env(fake_client), ThreadPoolExecutor(max_workers=2) as executor:
+            creation = executor.submit(provider.create_node_with_resources_and_labels, {}, tags, 1, {}, {})
+            try:
+                assert workspace_visible.wait(timeout=10)
+                discovery = executor.submit(discover)
+                assert discovery_started.wait(timeout=10)
+                try:
+                    observed = discovery.result(timeout=0.2)
+                except FutureTimeoutError:
+                    observed = None
+                if observed is not None:
+                    assert all(observed.values()), f"discovery saw an outdated worker: {observed}"
+            finally:
+                continue_submission.set()
+                created = creation.result(timeout=10)
+
+            assert set(created) == {"ws-1"}
+            assert discovery.result(timeout=10) == {"ws-1": True}
+
+    @pytest.mark.parametrize("blocked_workspace_id", ["ws-1", "ws-2"])
+    def test_discovered_workers_have_valid_launch_config_during_creation(self, blocked_workspace_id):
+        provider = _provider()
+        workspaces = []
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=workspaces)
+        fake_client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        )
+        creation_blocked = threading.Event()
+        continue_creation = threading.Event()
+
+        async def create_workspace(payload):
+            workspace = _worker_workspace(f"ws-{len(workspaces) + 1}", status="creating", name=payload["name"])
+            workspaces.append(workspace)
+            return workspace.copy()
+
+        async def get_workspace(workspace_id):
+            if workspace_id == blocked_workspace_id:
+                creation_blocked.set()
+                if not continue_creation.wait(timeout=10):
+                    raise TimeoutError("test did not release workspace creation")
+            workspace = next(workspace for workspace in workspaces if workspace["id"] == workspace_id)
+            workspace["status"] = "running"
+            return workspace.copy()
+
+        fake_client.workspaces.create.side_effect = create_workspace
+        fake_client.workspaces.get = AsyncMock(side_effect=get_workspace)
+        config = {"auth": {}, "available_node_types": {"worker": {"node_config": {}}}}
+        launch_hash = hash_launch_conf({}, config["auth"])
+        tags = {
+            TAG_RAY_USER_NODE_TYPE: "worker",
+            TAG_RAY_NODE_KIND: NODE_KIND_WORKER,
+            TAG_RAY_LAUNCH_CONFIG: launch_hash,
+        }
+        autoscaler = SimpleNamespace(
+            provider=provider,
+            disable_launch_config_check=False,
+            available_node_types=config["available_node_types"],
+            config=config,
+        )
+
+        with (
+            _patched_from_env(fake_client),
+            patch("src_ray_provider.node_provider.asyncio.sleep", new_callable=AsyncMock),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            creation = executor.submit(provider.create_node_with_resources_and_labels, {}, tags, 2, {}, {})
+            try:
+                assert creation_blocked.wait(timeout=10), "workspace creation did not reach the expected point"
+                assert not creation.done()
+                discovered = provider.non_terminated_nodes({})
+                assert set(discovered) == ({"ws-1"} if blocked_workspace_id == "ws-1" else {"ws-1", "ws-2"})
+                outdated = [
+                    node_id for node_id in discovered
+                    if not StandardAutoscaler.launch_config_ok(autoscaler, node_id)
+                ]
+                assert not outdated, f"Ray considers these workers outdated during creation: {outdated}"
+            finally:
+                continue_creation.set()
+                created = creation.result(timeout=10)
+
+            assert set(created) == {"ws-1", "ws-2"}
+            assert set(provider.non_terminated_nodes({})) == set(created)
+            for node_id in created:
+                assert StandardAutoscaler.launch_config_ok(autoscaler, node_id)
+
     def test_delegates_to_create_node_with_resources_and_labels(self):
         """``ray up``'s head-node bootstrap calls ``create_node`` directly
         (see ``ray.autoscaler._private.commands.get_or_create_head_node``),
@@ -1353,6 +1484,7 @@ class TestCreateNode:
         tags = {
             TAG_RAY_USER_NODE_TYPE: "head",
             TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
+            TAG_RAY_LAUNCH_CONFIG: "launch-hash",
         }
 
         async def advance_clock(seconds):
@@ -1367,6 +1499,7 @@ class TestCreateNode:
             provider.create_node({}, tags, 1)
 
         assert fake_client.workspaces.get.await_count == 1
+        assert provider._node_tag_cache.get("ws-1")[TAG_RAY_LAUNCH_CONFIG] == "launch-hash"
 
     def test_creates_requested_count_sequentially_in_one_client_session(self):
         provider = _provider()
