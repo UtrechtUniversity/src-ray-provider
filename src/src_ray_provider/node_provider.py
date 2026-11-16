@@ -533,7 +533,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             # ~/ray_bootstrap_key.pem, see ray.autoscaler._private.commands
             # ._set_up_config_for_head_node) when it is explicit, and this
             # provider can only turn a public key into the SRC catalog
-            # item's ray_public_key parameter (below) if one is given.
+            # item's public_key parameter (below) if one is given.
             # Without both, the head's autoscaler monitor has no private key
             # to SSH into newly created workers with -- so workers get
             # created successfully but every SSH attempt into them fails

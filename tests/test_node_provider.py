@@ -673,7 +673,7 @@ class TestBootstrapConfig:
         assert result["provider"]["ray_public_key_data"] == expected_public_key
         provider = ResearchCloudNodeProvider(result["provider"], CLUSTER_NAME)
         assert provider._workspace_creation_options(provider.head_node_type)["optional_parameters"][
-            "ray_public_key"
+            "public_key"
         ] == expected_public_key
 
         # A second bootstrap_config call (e.g. a repeat `ray up`) must reuse
