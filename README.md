@@ -9,6 +9,8 @@ Ray autoscaler node provider for SURF ResearchCloud (SRC) (read more [here](http
 ### Prerequisites
 
 - A ResearchCloud CO with the "Ray Head Node" and "Ray Worker" Catalog Items available.
+- For paused-workspace reuse, the "Ray Head (autoscaling)" Catalog Item must
+  also be available.
 - In this CO, create a CO secret called `RAY_SRC_TOKEN` and fill it with an SRC API key.
 
 **Security note**: to use Ray on SRC, you currently need to save an API key in a secret `RAY_SCR_TOKEN` inside your Collaboration. At the moment, ResearchCloud API keys cannot yet be scoped to a specific CO (coming soon), so it is best to test this package in a Collaboration to which only you have access.
@@ -50,7 +52,8 @@ provider:
 The `provider` block also requires `co_name` and `wallet_name`. Ray's
 `head_node_type` and `available_node_types` are generated from the size
 flavours available for the `Ray Head Node` and `Ray Worker` catalog items on
-the configured cloud. The smallest-CPU head flavour is generated as `head`
+the configured cloud. With paused-workspace reuse enabled, head flavours are
+instead discovered from `Ray Head (autoscaling)`. The smallest-CPU head flavour is generated as `head`
 and selected by default, and each generated worker node type uses the
 top-level `max_workers` limit.
 This catalog lookup happens before Ray validates the configuration during
@@ -82,8 +85,52 @@ To customize the default `head` through `available_node_types.head`, also set
 `head_node_type: head` so Ray applies head-specific defaults before discovery.
 Other generated node type names use a lowercase `head_` or `worker_` prefix
 followed by the normalized size-flavour name. `node_config.catalog_item_name`
-can be overridden per node type; the default remains `Ray Head Node` or
-`Ray Worker` according to the generated type.
+can be overridden per node type; the default remains `Ray Head Node` (or
+`Ray Head (autoscaling)` with reuse enabled) or `Ray Worker` according to the
+generated type.
+
+### Reusing paused workspaces
+
+Opt in to pause and reuse workspaces instead of deleting them:
+
+```yaml
+provider:
+  resume_paused_workspaces: true
+  resume_min_ttl_seconds: 86400  # default: 24 hours
+```
+
+Ray scale-down and `ray down` will **pause**, not delete, these workspaces.
+They retain their data and may continue to incur costs until they expire or
+are deleted manually. The provider waits for each pause to finish. Both head
+and worker workspaces can be resumed on a later `ray up` or scale-up. A
+candidate must belong to this cluster, match the requested catalog item and
+size flavour and launch configuration, and have strictly more than the
+configured number of seconds remaining before its `end_time`. Workspaces with
+missing, invalid, or timezone-less expiry times are not reused.
+
+Only workspaces previously created with reuse enabled are eligible: their
+creation settings must match, including the SSH public key, Ray and Python
+versions, and, for workers, the current head's private IP. Workspaces created
+without this option are not assumed to have the systemd setup required for
+reuse. An incompatible or near-expiry workspace remains paused and a new one
+is created instead. If `head_workspace_id` is configured, an incompatible
+paused head causes an error rather than creating a different head.
+
+With reuse enabled, new workspaces request `do_setup=true`, and workers
+receive the running head's private address as `head_node_address`. The SRC
+component's systemd services start Ray and the autoscaler, so the provider
+replaces global and per-node-type `worker_setup_commands` with empty lists and
+replaces both `worker_start_ray_commands` and `head_start_ray_commands` with a
+no-op. This also suppresses shared `setup_commands` on workers; head setup is
+unchanged. The selected head type must use `Ray Head (autoscaling)`. Both
+catalog items must support these optional parameters and systemd services.
+
+On the same machine and account, workspace selection, submission, and pausing
+are serialized. Across machines, avoiding duplicate claims of a paused
+workspace relies on SRC atomically rejecting concurrent resume actions; a
+rejected claim is reported as an error. The SDK does not expose a distributed
+lock for new workspace creation, so do not run concurrent `ray up` commands
+for the same cluster from different machines.
 
 ### Using an existing head workspace
 
@@ -134,7 +181,8 @@ public-key file during bootstrap and passes its contents to the SRC catalog
 item.
 
 The provider polls an SRC workspace until it reaches `running` before returning
-the node to Ray. The wait is bounded by `provider.workspace_creation_timeout`
+the node to Ray. When reuse is enabled it also waits for `paused` on termination.
+Each wait is bounded by `provider.workspace_creation_timeout`
 (seconds), which defaults to 2400:
 
 ```yaml

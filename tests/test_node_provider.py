@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import platform
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -29,11 +31,14 @@ from ray.autoscaler.tags import (
 from researchcloud.config import DEFAULT_CLOUD_NAME
 from researchcloud.errors import ApiError
 from src_ray_provider.node_provider import (
+    AUTOSCALING_HEAD_CATALOG_ITEM_NAME,
     DEFAULT_HEAD_CATALOG_ITEM_NAME,
     DEFAULT_OS_FLAVOUR_NAME,
     DEFAULT_WORKER_CATALOG_ITEM_NAME,
     DEFAULT_WORKSPACE_CREATION_TIMEOUT,
     ResearchCloudNodeProvider,
+    _write_json_object,
+    _workspace_tags_description,
     sanitize_name_component,
 )
 
@@ -216,7 +221,7 @@ class TestBootstrapConfig:
             async def resolve_offering_and_flavours(
                 self, catalog_item, co_id, products, cloud_name, os_flavour_name, size_flavour_name
             ):
-                if catalog_item["name"] == DEFAULT_HEAD_CATALOG_ITEM_NAME:
+                if catalog_item["name"] in {DEFAULT_HEAD_CATALOG_ITEM_NAME, AUTOSCALING_HEAD_CATALOG_ITEM_NAME}:
                     size_flavours = [
                         "2 Core - 8 GB",
                         "GPU 4 Core - 1x A100",
@@ -254,6 +259,34 @@ class TestBootstrapConfig:
         assert "ray.head.default" not in result["available_node_types"]
         assert "ray.worker.default" not in result["available_node_types"]
         assert "_src_node_types_resolved" not in result["provider"]
+
+    def test_ray_bootstrap_configures_systemd_for_reuse(self):
+        config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
+        config["provider"]["resume_paused_workspaces"] = True
+
+        result = _bootstrap_config(config, no_config_cache=True)
+
+        assert result["worker_setup_commands"] == []
+        assert result["worker_start_ray_commands"] == ["true"]
+        assert result["head_start_ray_commands"] == ["true"]
+        assert result["available_node_types"]["head"]["node_config"]["catalog_item_name"] == (
+            AUTOSCALING_HEAD_CATALOG_ITEM_NAME
+        )
+        assert result["provider"]["node_types"]["head"]["catalog_item_name"] == AUTOSCALING_HEAD_CATALOG_ITEM_NAME
+
+    def test_reuse_overrides_worker_setup_commands(self):
+        config = yaml.safe_load((Path(__file__).parent.parent / "cluster.yaml").read_text())
+        config["provider"]["resume_paused_workspaces"] = True
+        config["worker_setup_commands"] = ["echo not supported"]
+        config["setup_commands"] = ["echo shared setup"]
+        config["available_node_types"] = {
+            "worker_4_core_16_gb": {"worker_setup_commands": ["echo node setup"]}
+        }
+
+        result = _bootstrap_config(config, no_config_cache=True)
+        assert result["worker_setup_commands"] == []
+        assert result["available_node_types"]["worker_4_core_16_gb"]["worker_setup_commands"] == []
+        assert "echo shared setup" in result["head_setup_commands"]
 
     def test_ray_bootstrap_merges_partial_generated_node_type_override(self):
         config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
@@ -756,6 +789,8 @@ class _FakeWorkspacesService:
         self.build_create_payload_from_names = AsyncMock()
         self.create = AsyncMock()
         self.delete = AsyncMock()
+        self.pause = AsyncMock()
+        self.resume = AsyncMock()
         self._get_by_id = get_by_id
 
     async def get(self, workspace_id: str) -> dict:
@@ -898,6 +933,12 @@ def _head_workspace(id: str, status: str = "running", name: str | None = None) -
         catalog_item_name=DEFAULT_HEAD_CATALOG_ITEM_NAME,
         flavor_name="2 Core - 8 GB",
     )
+
+
+def _autoscaling_head_workspace(id: str, status: str = "running", name: str | None = None) -> dict:
+    workspace = _head_workspace(id, status, name)
+    workspace["meta"]["application_name"] = AUTOSCALING_HEAD_CATALOG_ITEM_NAME
+    return workspace
 
 
 class TestNonTerminatedNodes:
@@ -1149,6 +1190,20 @@ class TestNodeTags:
 
 class TestNodeTagCache:
     """Covers persisting mutable Ray tags that SRC cannot update."""
+
+    @pytest.mark.parametrize("new_tags", [{"new": "value"}, {}])
+    def test_replace_updates_one_node_in_one_write(self, new_tags):
+        provider = _provider()
+        cache = provider._node_tag_cache
+        cache.update("ws-1", {"old": "value"})
+        cache.update("ws-2", {"other": "value"})
+
+        with patch("src_ray_provider.node_provider._write_json_object", wraps=_write_json_object) as write:
+            cache.replace("ws-1", new_tags)
+
+        assert write.call_count == 1
+        assert cache.get("ws-1") == new_tags
+        assert cache.get("ws-2") == {"other": "value"}
 
     def test_set_node_tags_persists_and_is_merged_into_node_tags(self):
         provider = _provider()
@@ -1634,3 +1689,426 @@ class TestNodeLifecycleFor404:
 
         with _patched_from_env(fake_client), pytest.raises(ApiError):
             provider.is_running("ws-1")
+
+
+def _reuse_tags(node_type: str) -> dict[str, str]:
+    return {
+        TAG_RAY_USER_NODE_TYPE: node_type,
+        TAG_RAY_NODE_KIND: NODE_KIND_HEAD if node_type == "head" else NODE_KIND_WORKER,
+        TAG_RAY_LAUNCH_CONFIG: "launch-hash",
+    }
+
+
+def _paused_reusable(provider, node_type, workspace_id, head_address=None):
+    workspace = _autoscaling_head_workspace(workspace_id, "paused") if node_type == "head" else _worker_workspace(
+        workspace_id, "paused"
+    )
+    workspace["end_time"] = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    workspace["description"] = _workspace_tags_description(
+        _reuse_tags(node_type), provider._reuse_configuration(node_type, head_address)
+    )
+    return workspace
+
+
+class TestResumePausedWorkspaces:
+    @pytest.mark.parametrize("value", ["true", 1, None])
+    def test_requires_boolean_opt_in(self, value):
+        with pytest.raises(ValueError, match="resume_paused_workspaces.*boolean"):
+            _provider(resume_paused_workspaces=value)
+
+    def test_requires_cross_process_locking(self):
+        with patch("src_ray_provider.node_provider.fcntl", None), pytest.raises(RuntimeError, match="POSIX"):
+            _provider(resume_paused_workspaces=True)
+
+    def test_requires_autoscaling_head_catalog_item(self):
+        config = {
+            "head": {"size_flavour_name": "2 Core - 8 GB", "catalog_item_name": DEFAULT_HEAD_CATALOG_ITEM_NAME},
+            "worker": {"size_flavour_name": "4 Core - 16 GB"},
+        }
+        with pytest.raises(ValueError, match="Ray Head \\(autoscaling\\)"):
+            _provider(resume_paused_workspaces=True, node_types=config)
+
+    @pytest.mark.parametrize("value", [0, -1, True, float("inf")])
+    def test_requires_positive_finite_minimum_ttl(self, value):
+        with pytest.raises(ValueError, match="resume_min_ttl_seconds"):
+            _provider(resume_min_ttl_seconds=value)
+
+    def test_resumes_head_for_ray_up_and_hides_paused_nodes(self):
+        provider = _provider(resume_paused_workspaces=True)
+        head = _paused_reusable(provider, "head", "head-1")
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+
+        async def resume(workspace_id):
+            assert workspace_id == "head-1"
+            head["status"] = "running"
+
+        fake_client.workspaces.resume.side_effect = resume
+        fake_client.workspaces.get = AsyncMock(side_effect=lambda workspace_id: head.copy())
+        with _patched_from_env(fake_client):
+            assert provider.non_terminated_nodes({}) == []
+            assert provider.is_terminated("head-1")
+            result = provider.create_node({}, _reuse_tags("head"), 1)
+            assert provider.non_terminated_nodes({TAG_RAY_NODE_KIND: NODE_KIND_HEAD}) == ["head-1"]
+        assert result["head-1"]["status"] == "running"
+        assert provider.node_tags("head-1")[TAG_RAY_LAUNCH_CONFIG] == "launch-hash"
+        fake_client.workspaces.create.assert_not_awaited()
+
+    def test_resumes_matching_worker_then_creates_remainder_with_head_address(self):
+        provider = _provider(resume_paused_workspaces=True)
+        head = _autoscaling_head_workspace("head-1")
+        head["resource_meta"]["local_ip"] = "10.0.0.10"
+        worker = _paused_reusable(provider, "worker", "worker-1", "10.0.0.10")
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[head, worker])
+
+        async def resume(workspace_id):
+            worker["status"] = "running"
+
+        fake_client.workspaces.resume.side_effect = resume
+        fake_client.workspaces.get = AsyncMock(side_effect=lambda workspace_id: worker.copy())
+        fake_client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        )
+        fake_client.workspaces.create.return_value = {"id": "worker-2", "status": "running"}
+
+        with _patched_from_env(fake_client):
+            result = provider.create_node({}, _reuse_tags("worker"), 2)
+
+        assert set(result) == {"worker-1", "worker-2"}
+        parameters = fake_client.workspaces.build_create_payload_from_names.await_args.kwargs["optional_parameters"]
+        assert parameters["do_setup"] == "true"
+        assert parameters["head_node_address"] == "10.0.0.10"
+        fake_client.workspaces.resume.assert_awaited_once_with("worker-1")
+        assert fake_client.workspaces.list.await_count == 2
+
+    def test_reads_independently_encoded_workspace_metadata(self):
+        provider = _provider(resume_paused_workspaces=True)
+        head = _autoscaling_head_workspace("head-1", "paused")
+        head["end_time"] = "2099-01-01T00:00:00Z"
+        configuration = provider._reuse_configuration("head", None)
+        head["description"] = (
+            'src-ray-provider-tags:v1:{"ray-launch-config":"launch-hash",'
+            f'"src-reuse-configuration":"{configuration}","other":"ignored"}}'
+        )
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+        with _patched_from_env(client):
+            provider.non_terminated_nodes({})
+            assert provider.node_tags("head-1")[TAG_RAY_LAUNCH_CONFIG] == "launch-hash"
+        assert provider._can_resume_workspace(head, "head", _reuse_tags("head"), configuration)
+
+    def test_reuse_configuration_hash_covers_creation_settings(self):
+        provider = _provider(resume_paused_workspaces=True)
+        expected_options = {
+            "catalog_item_name": DEFAULT_WORKER_CATALOG_ITEM_NAME,
+            "cloud_name": DEFAULT_CLOUD_NAME,
+            "os_flavour_name": DEFAULT_OS_FLAVOUR_NAME,
+            "size_flavour_name": "4 Core - 16 GB",
+            "use_private_network": True,
+            "network_name_hint": None,
+            "optional_parameters": {
+                **EXPECTED_OPTIONAL_PARAMETERS,
+                "do_setup": "true",
+                "head_node_address": "10.0.0.10",
+            },
+        }
+        expected = hashlib.sha256(
+            json.dumps(expected_options, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        assert provider._reuse_configuration("worker", "10.0.0.10") == expected
+
+    @pytest.mark.parametrize("description", [
+        "src-ray-provider-tags:v1:{",
+        "src-ray-provider-tags:v1:[]",
+        "src-ray-provider-tags:v1:null",
+    ])
+    def test_malformed_metadata_is_logged_and_not_reused(self, description, caplog):
+        provider = _provider(resume_paused_workspaces=True)
+        head = _paused_reusable(provider, "head", "head-1")
+        head["description"] = description
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+        with _patched_from_env(client):
+            provider.non_terminated_nodes({})
+            assert TAG_RAY_LAUNCH_CONFIG not in provider.node_tags("head-1")
+        assert not provider._can_resume_workspace(
+            head, "head", _reuse_tags("head"), provider._reuse_configuration("head", None)
+        )
+        assert "Ignoring malformed Ray tags in workspace description" in caplog.text
+
+    @pytest.mark.parametrize("reuse,status,inactive", [
+        (False, "paused", False), (False, "pausing", False),
+        (True, "paused", True), (True, "pausing", True),
+        (False, "running", False), (True, "running", False),
+        (False, "deleted", True), (True, "deleted", True),
+    ])
+    def test_discovery_and_is_terminated_agree(self, reuse, status, inactive):
+        provider = _provider(resume_paused_workspaces=reuse)
+        worker = _worker_workspace("worker-1", status)
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[worker])
+        with _patched_from_env(client):
+            assert provider.non_terminated_nodes({}) == ([] if inactive else ["worker-1"])
+            assert provider.is_terminated("worker-1") is inactive
+
+    @pytest.mark.parametrize("change", ["expired", "missing_end", "naive_end", "bad_end", "wrong_type",
+                                       "wrong_cluster", "wrong_launch", "wrong_setup", "wrong_head"])
+    def test_rejects_incompatible_workspace(self, change):
+        provider = _provider(resume_paused_workspaces=True, resume_min_ttl_seconds=3600)
+        worker = _paused_reusable(provider, "worker", "worker-1", "10.0.0.10")
+        if change == "expired":
+            worker["end_time"] = (datetime.now(timezone.utc) + timedelta(minutes=59)).isoformat()
+        elif change == "missing_end":
+            del worker["end_time"]
+        elif change == "naive_end":
+            worker["end_time"] = "2099-01-01T00:00:00"
+        elif change == "bad_end":
+            worker["end_time"] = "not-a-date"
+        elif change == "wrong_type":
+            worker["meta"]["flavours"][0]["name"] = "wrong flavour"
+        elif change == "wrong_cluster":
+            worker["name"] = "ray-other-worker"
+        elif change == "wrong_launch":
+            worker["description"] = worker["description"].replace("launch-hash", "old-hash")
+        elif change == "wrong_setup":
+            worker["description"] = _workspace_tags_description(_reuse_tags("worker"))
+        elif change == "wrong_head":
+            worker["description"] = _workspace_tags_description(
+                _reuse_tags("worker"), provider._reuse_configuration("worker", "10.0.0.11")
+            )
+        assert not provider._can_resume_workspace(
+            worker, "worker", _reuse_tags("worker"), provider._reuse_configuration("worker", "10.0.0.10")
+        )
+
+    def test_ttl_is_strictly_greater_than_threshold(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        provider = _provider(resume_paused_workspaces=True, resume_min_ttl_seconds=3600)
+        head = _paused_reusable(provider, "head", "head-1")
+        configuration = provider._reuse_configuration("head", None)
+        with patch("src_ray_provider.node_provider.datetime", FixedDateTime):
+            head["end_time"] = (now + timedelta(seconds=3600)).isoformat()
+            assert not provider._can_resume_workspace(head, "head", _reuse_tags("head"), configuration)
+            head["end_time"] = (now + timedelta(seconds=3601)).isoformat()
+            assert provider._can_resume_workspace(head, "head", _reuse_tags("head"), configuration)
+
+    def test_atomic_claim_failure_propagates_without_creating_a_duplicate(self):
+        provider = _provider(resume_paused_workspaces=True)
+        head = _paused_reusable(provider, "head", "head-1")
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+        client.workspaces.resume.side_effect = ApiError(409, "resume", {"detail": "already claimed"})
+        with _patched_from_env(client), pytest.raises(ApiError):
+            provider.create_node({}, _reuse_tags("head"), 1)
+        client.workspaces.create.assert_not_awaited()
+
+    def test_pause_is_used_for_termination_and_tags_are_discarded(self):
+        provider = _provider(resume_paused_workspaces=True)
+        client = _FakeClient(
+            co={"id": "co-1"}, workspaces=[], get_by_id={"worker-1": _worker_workspace("worker-1", "paused")}
+        )
+        provider._node_tag_cache.update("worker-1", {"old": "tag"})
+        with _patched_from_env(client):
+            provider.terminate_node("worker-1")
+        client.workspaces.pause.assert_awaited_once_with("worker-1")
+        client.workspaces.delete.assert_not_awaited()
+        assert provider._node_tag_cache.get("worker-1") == {}
+
+    def test_waits_until_pause_is_complete(self):
+        provider = _provider(resume_paused_workspaces=True)
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[])
+        client.workspaces.get = AsyncMock(side_effect=[
+            _worker_workspace("worker-1", "pausing"),
+            _worker_workspace("worker-1", "paused"),
+        ])
+        with _patched_from_env(client), patch("src_ray_provider.node_provider.asyncio.sleep", new_callable=AsyncMock):
+            provider.terminate_node("worker-1")
+        assert client.workspaces.get.await_count == 2
+
+    def test_pause_timeout_reports_target_and_retains_cached_tags(self):
+        provider = _provider(resume_paused_workspaces=True, workspace_creation_timeout=5)
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[])
+        client.workspaces.get = AsyncMock(return_value=_worker_workspace("worker-1", "pausing"))
+        provider._node_tag_cache.update("worker-1", {"old": "tag"})
+        clock = SimpleNamespace(now=0.0)
+
+        async def advance(seconds):
+            clock.now += seconds
+
+        with (
+            _patched_from_env(client),
+            patch("src_ray_provider.node_provider.asyncio.get_running_loop",
+                  return_value=SimpleNamespace(time=lambda: clock.now)),
+            patch("src_ray_provider.node_provider.asyncio.sleep", side_effect=advance),
+            pytest.raises(TimeoutError, match="did not reach 'paused' state for 5 seconds"),
+        ):
+            provider.terminate_node("worker-1")
+        assert client.workspaces.get.await_count == 2
+        assert provider._node_tag_cache.get("worker-1") == {"old": "tag"}
+
+    def test_pause_terminal_status_is_reported(self):
+        provider = _provider(resume_paused_workspaces=True)
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[])
+        client.workspaces.get = AsyncMock(return_value=_worker_workspace("worker-1", "failed"))
+        with _patched_from_env(client), pytest.raises(
+            RuntimeError, match="terminal status 'failed' while pausing"
+        ):
+            provider.terminate_node("worker-1")
+
+    def test_resume_waits_for_pause_tag_cleanup(self):
+        pausing_provider = _provider(resume_paused_workspaces=True)
+        resuming_provider = _provider(resume_paused_workspaces=True)
+        head = _paused_reusable(pausing_provider, "head", "head-1")
+        head["status"] = "running"
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+        client.workspaces.get = AsyncMock(side_effect=lambda workspace_id: head.copy())
+        cleanup_started = threading.Event()
+        allow_cleanup = threading.Event()
+        resume_called = threading.Event()
+        resume_started = threading.Event()
+        original_discard = pausing_provider._node_tag_cache.discard
+
+        async def pause(workspace_id):
+            head["status"] = "paused"
+
+        async def resume(workspace_id):
+            resume_called.set()
+            head["status"] = "running"
+
+        def delayed_discard(node_ids):
+            cleanup_started.set()
+            if not allow_cleanup.wait(timeout=10):
+                raise TimeoutError("test did not release cleanup")
+            original_discard(node_ids)
+
+        def resume_node():
+            resume_started.set()
+            return resuming_provider.create_node({}, tags, 1)
+
+        client.workspaces.pause.side_effect = pause
+        client.workspaces.resume.side_effect = resume
+        tags = {**_reuse_tags("head"), "new-status": "new"}
+        with (
+            _patched_from_env(client),
+            patch.object(pausing_provider._node_tag_cache, "discard", side_effect=delayed_discard),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            pausing = executor.submit(pausing_provider.terminate_node, "head-1")
+            try:
+                assert cleanup_started.wait(timeout=10)
+                resuming = executor.submit(resume_node)
+                assert resume_started.wait(timeout=10)
+                assert not resume_called.wait(timeout=0.2)
+            finally:
+                allow_cleanup.set()
+            pausing.result(timeout=10)
+            assert list(resuming.result(timeout=10)) == ["head-1"]
+        assert resuming_provider._node_tag_cache.get("head-1")["new-status"] == "new"
+
+    def test_resume_waits_for_running_and_clears_old_mutable_tags(self):
+        provider = _provider(resume_paused_workspaces=True)
+        head = _paused_reusable(provider, "head", "head-1")
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+        client.workspaces.get = AsyncMock(side_effect=[
+            {**head, "status": "resuming"},
+            {**head, "status": "running"},
+        ])
+        provider._node_tag_cache.update("head-1", {"old": "tag"})
+        with _patched_from_env(client), patch("src_ray_provider.node_provider.asyncio.sleep", new_callable=AsyncMock):
+            assert provider.create_node({}, _reuse_tags("head"), 1)["head-1"]["status"] == "running"
+        assert "old" not in provider._node_tag_cache.get("head-1")
+        assert client.workspaces.get.await_count == 2
+
+    def test_resume_terminal_status_is_reported(self):
+        provider = _provider(resume_paused_workspaces=True)
+        head = _paused_reusable(provider, "head", "head-1")
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+        client.workspaces.get = AsyncMock(return_value={**head, "status": "failed"})
+        with _patched_from_env(client), pytest.raises(RuntimeError, match="terminal status 'failed'"):
+            provider.create_node({}, _reuse_tags("head"), 1)
+
+    def test_concurrent_local_head_claims_resume_only_once(self):
+        provider = _provider(resume_paused_workspaces=True)
+        second_provider = _provider(resume_paused_workspaces=True)
+        head = _paused_reusable(provider, "head", "head-1")
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[head])
+        resuming = threading.Event()
+        release = threading.Event()
+
+        async def resume(workspace_id):
+            resuming.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("test did not release resume")
+            head["status"] = "running"
+
+        client.workspaces.resume.side_effect = resume
+        client.workspaces.get = AsyncMock(side_effect=lambda workspace_id: head.copy())
+        with _patched_from_env(client), ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(provider.create_node, {}, _reuse_tags("head"), 1)
+            try:
+                assert resuming.wait(timeout=10)
+                second = executor.submit(second_provider.create_node, {}, _reuse_tags("head"), 1)
+            finally:
+                release.set()
+            assert list(first.result(timeout=10)) == ["head-1"]
+            with pytest.raises(RuntimeError, match="another head"):
+                second.result(timeout=10)
+        client.workspaces.resume.assert_awaited_once_with("head-1")
+        client.workspaces.create.assert_not_awaited()
+
+    def test_concurrent_local_head_creation_is_serialized(self):
+        provider = _provider(resume_paused_workspaces=True)
+        second_provider = _provider(resume_paused_workspaces=True)
+        workspaces = []
+        client = _FakeClient(co={"id": "co-1"}, workspaces=workspaces)
+        submitting = threading.Event()
+        release = threading.Event()
+        client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        )
+
+        async def create(payload):
+            submitting.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("test did not release creation")
+            head = _autoscaling_head_workspace("head-1", name=payload["name"])
+            workspaces.append(head)
+            return head
+
+        client.workspaces.create.side_effect = create
+        with _patched_from_env(client), ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(provider.create_node, {}, _reuse_tags("head"), 1)
+            try:
+                assert submitting.wait(timeout=10)
+                second = executor.submit(second_provider.create_node, {}, _reuse_tags("head"), 1)
+            finally:
+                release.set()
+            assert list(first.result(timeout=10)) == ["head-1"]
+            with pytest.raises(RuntimeError, match="another head"):
+                second.result(timeout=10)
+        client.workspaces.create.assert_awaited_once()
+        parameters = client.workspaces.build_create_payload_from_names.await_args.kwargs["optional_parameters"]
+        assert parameters["do_setup"] == "true"
+        assert "head_node_address" not in parameters
+
+    def test_matches_custom_catalogue_item_and_flavour(self):
+        provider = _provider(
+            resume_paused_workspaces=True,
+            node_types={
+                "head": {"size_flavour_name": "2 Core - 8 GB"},
+                "worker": {"catalog_item_name": "Custom Worker", "size_flavour_name": "8 Core - 32 GB"},
+            },
+        )
+        worker = _paused_reusable(provider, "worker", "worker-1", "10.0.0.10")
+        worker["meta"]["application_name"] = "Custom Worker"
+        worker["meta"]["flavours"][0]["name"] = "8 Core - 32 GB"
+        assert provider._can_resume_workspace(
+            worker, "worker", _reuse_tags("worker"), provider._reuse_configuration("worker", "10.0.0.10")
+        )
+
+    def test_worker_creation_requires_a_running_head_with_private_ip(self):
+        provider = _provider(resume_paused_workspaces=True)
+        client = _FakeClient(co={"id": "co-1"}, workspaces=[_autoscaling_head_workspace("head-1")])
+        with _patched_from_env(client), pytest.raises(ValueError, match="no private IP"):
+            provider.create_node({}, _reuse_tags("worker"), 1)
+        client.workspaces.create.assert_not_awaited()
