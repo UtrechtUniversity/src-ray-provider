@@ -1,10 +1,10 @@
 """SURF ResearchCloud node provider for Ray.
 
-This slice discovers workspaces as Ray nodes and derives their static,
-creation-time tags (node kind, user node type, cluster name) entirely from
-queryable workspace fields — no tag data is persisted in the workspace
-itself. Node creation and SSH address lookup are supported; mutable tags
-are cached locally, and termination delegates to the workspace delete API.
+This slice discovers workspaces as Ray nodes and derives their identity tags
+(node kind, user node type, cluster name) from queryable workspace fields.
+The immutable launch-config tag is stored in the workspace description;
+mutable tags are cached locally. Node creation and SSH address lookup are
+supported, and termination delegates to the workspace delete API.
 
 Static tag derivation works as follows, trading a small amount of config
 duplication for avoiding any persisted/free-text tag storage:
@@ -48,19 +48,12 @@ duplication for avoiding any persisted/free-text tag storage:
   with ``ray-{cluster_name}-`` (sanitized to fit SRC's naming rules). An
   existing head workspace can instead be identified by ``head_workspace_id``.
 
-Mutable Ray tags (notably ``TAG_RAY_LAUNCH_CONFIG``, written once at node
-creation and read back by ``ray up``/the autoscaler on every subsequent
-invocation to decide whether a node is out-of-date) have nowhere to live in
-SRC itself: the workspace API has no generic tag/label/metadata store. Since
-losing ``TAG_RAY_LAUNCH_CONFIG`` makes every node look permanently
-out-of-date -- causing ``ray up`` to terminate and recreate an otherwise
-healthy head node on every single run -- these tags are cached in a local
-JSON file under ``~/.cache/src_ray_provider/node_tags/<cluster_name>.json``
-(see ``_NodeTagCache``). This is necessarily local to the machine/account
-running a given Ray command: a laptop running ``ray up`` and the autoscaler
-monitor running on the head node each keep their own cache file, so this
-only fixes repeat invocations from the *same* machine (which is the normal
-case for both ``ray up`` and the head-resident autoscaler monitor).
+Ray's immutable ``TAG_RAY_LAUNCH_CONFIG`` tag is stored in the workspace
+description at creation time, so it is available to ``ray up`` and the
+autoscaler regardless of which machine reads the workspace. Other mutable
+Ray tags remain in a local JSON file under
+``~/.cache/src_ray_provider/node_tags/<cluster_name>.json`` (see
+``_NodeTagCache``), because the workspace API has no tag update operation.
 
 SSH access for both the head and worker nodes relies on ``auth.ssh_public_key``
 /``auth.ssh_private_key`` in cluster.yaml, which ``bootstrap_config`` requires
@@ -105,6 +98,7 @@ from ray.autoscaler.tags import (
     NODE_KIND_HEAD,
     NODE_KIND_WORKER,
     TAG_RAY_CLUSTER_NAME,
+    TAG_RAY_LAUNCH_CONFIG,
     TAG_RAY_NODE_KIND,
     TAG_RAY_USER_NODE_TYPE,
 )
@@ -131,6 +125,8 @@ logger = logging.getLogger(__name__)
 
 NODE_TAG_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "node_tags"
 SSH_KEY_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "ssh_keys"
+_WORKSPACE_TAGS_DESCRIPTION_PREFIX = "src-ray-provider-tags:v1:"
+_IMMUTABLE_LAUNCH_TAGS = frozenset({TAG_RAY_LAUNCH_CONFIG})
 
 def deep_merge(base: dict, override: dict) -> dict:
     """Return base overlaid with override."""
@@ -406,14 +402,11 @@ def _write_json_object(path: Path, data: Mapping[str, Any]) -> None:
 class _NodeTagCache:
     """Persist Ray's mutable, per-node tags to a local JSON file.
 
-    SRC workspaces have no generic tag/label/metadata store, so tags Ray
-    writes after node creation (notably ``TAG_RAY_LAUNCH_CONFIG``, used to
-    detect out-of-date nodes) cannot be saved on the workspace itself. This
-    keeps them in ``~/.cache/src_ray_provider/node_tags/<cluster_name>.json``
-    instead, keyed by SRC workspace id, so they survive across separate
-    ``ray`` command invocations on the same machine/account. A sibling
-    ``.lock`` file provides cross-process safety for concurrent readers and
-    writers (e.g. ``ray up`` and the autoscaler monitor) on that machine.
+    SRC workspaces have no tag update operation, so mutable tags Ray writes
+    after node creation are kept in
+    ``~/.cache/src_ray_provider/node_tags/<cluster_name>.json``, keyed by SRC
+    workspace id. A sibling ``.lock`` file provides cross-process safety for
+    concurrent readers and writers on that machine.
     """
 
     def __init__(self, cluster_name: str, cache_dir: Path) -> None:
@@ -449,6 +442,36 @@ class _NodeTagCache:
                     changed = True
             if changed:
                 _write_json_object(self._path, cache)
+
+
+def _workspace_tags_description(tags: Mapping[str, str]) -> str:
+    launch_tags = {
+        key: value
+        for key, value in tags.items()
+        if key in _IMMUTABLE_LAUNCH_TAGS and isinstance(value, str)
+    }
+    if not launch_tags:
+        return ""
+    return _WORKSPACE_TAGS_DESCRIPTION_PREFIX + json.dumps(launch_tags, separators=(",", ":"))
+
+
+def _launch_tags_from_workspace_description(description: Any) -> dict[str, str]:
+    if not isinstance(description, str) or not description.startswith(_WORKSPACE_TAGS_DESCRIPTION_PREFIX):
+        return {}
+    encoded_tags = description[len(_WORKSPACE_TAGS_DESCRIPTION_PREFIX):]
+    try:
+        tags = json.loads(encoded_tags)
+    except json.JSONDecodeError:
+        logger.warning("Ignoring malformed Ray tags in workspace description")
+        return {}
+    if not isinstance(tags, dict):
+        logger.warning("Ignoring malformed Ray tags in workspace description")
+        return {}
+    return {
+        key: value
+        for key, value in tags.items()
+        if key in _IMMUTABLE_LAUNCH_TAGS and isinstance(value, str)
+    }
 
 
 def sanitize_name_component(value: str) -> str:
@@ -740,10 +763,9 @@ class ResearchCloudNodeProvider(NodeProvider):
         or creating the shared private network. API rejections are isolated
         to their workspace; other errors propagate.
 
-        ``tags`` (e.g. ``TAG_RAY_LAUNCH_CONFIG``, ``TAG_RAY_NODE_STATUS``)
-        are cached locally per created workspace id -- see ``_NodeTagCache``
-        -- since SRC has nowhere to store them and losing them would make
-        every node look permanently out-of-date to Ray.
+        ``TAG_RAY_LAUNCH_CONFIG`` is stored in the workspace description;
+        mutable tags (e.g. ``TAG_RAY_NODE_STATUS``) remain in the local
+        ``_NodeTagCache``.
         """
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise ValueError(f"node creation count must be a non-negative integer, got {count!r}")
@@ -780,6 +802,7 @@ class ResearchCloudNodeProvider(NodeProvider):
                     co_name=self.co_name,
                     wallet_name=self.wallet_name,
                     workspace_name=workspace_name,
+                    description=_workspace_tags_description(tags),
                     **self._workspace_creation_options(node_type),
                 )
                 cli_logger.verbose(
@@ -793,7 +816,10 @@ class ResearchCloudNodeProvider(NodeProvider):
                     with self._creation_lock, _locked_cache_file(self._creation_lock_path):
                         workspace = await client.workspaces.create(plan.payload)
                         workspace_id = self._workspace_id(workspace)
-                        self._node_tag_cache.update(workspace_id, tags)
+                        mutable_tags = {
+                            key: value for key, value in tags.items() if key not in _IMMUTABLE_LAUNCH_TAGS
+                        }
+                        self._node_tag_cache.update(workspace_id, mutable_tags)
                 except ApiError as exc:
                     logger.error(
                         "Failed to create SRC workspace %r for Ray node type %r (HTTP %s): %s",
@@ -1008,16 +1034,20 @@ class ResearchCloudNodeProvider(NodeProvider):
             )
 
     def _node_tags_for_workspace(self, workspace: Mapping[str, Any]) -> dict[str, str]:
-        """Derive this workspace's static Ray tags from queryable fields only.
+        """Derive identity tags and immutable launch tags from the workspace.
 
         The cluster name tag is always ``self.cluster_name`` once a
         workspace has passed :meth:`_belongs_to_cluster`'s name-prefix
         check; node type and kind are only included if the workspace's
         catalog item + size flavour resolve to a configured node type
         (e.g. they won't for a workspace whose flavour was changed
-        out-of-band after creation).
+        out-of-band after creation). The launch-config tag is read from the
+        description set at creation time.
         """
-        tags = {TAG_RAY_CLUSTER_NAME: self.cluster_name}
+        tags = {
+            TAG_RAY_CLUSTER_NAME: self.cluster_name,
+            **_launch_tags_from_workspace_description(workspace.get("description")),
+        }
         if self.head_workspace_id is not None and workspace.get("id") == self.head_workspace_id:
             self._validate_head_workspace(workspace)
         node_type = self._node_type_for_workspace(workspace)
@@ -1166,10 +1196,9 @@ class ResearchCloudNodeProvider(NodeProvider):
     def node_tags(self, node_id: str) -> Dict[str, str]:
         """Return this node's tags: identity tags (node kind, user node
         type, cluster name) derived from queryable workspace fields, merged
-        with any mutable tags Ray has written via ``create_node``/
-        ``set_node_tags`` and cached locally (see ``_NodeTagCache``, since
-        SRC has nowhere to store them). Derived identity tags always win on
-        key conflicts, since they reflect the workspace's actual state.
+        with its immutable launch tags from the description and any mutable
+        tags Ray has written via ``set_node_tags`` and cached locally.
+        Workspace-derived tags always win on key conflicts.
         """
         workspace = self._get_cached_or_fetch(node_id)
         if workspace is None:
@@ -1184,14 +1213,13 @@ class ResearchCloudNodeProvider(NodeProvider):
         Identity tags (node kind, user node type, cluster name) are derived
         from workspace fields and cannot be changed independently, so writes
         to those keys are cached but ultimately ignored by ``node_tags``
-        (which always prefers the derived value). Everything else -- e.g.
-        ``TAG_RAY_LAUNCH_CONFIG``, ``TAG_RAY_RUNTIME_CONFIG``,
-        ``TAG_RAY_NODE_STATUS`` -- has no home in the SRC workspace itself,
-        so it is kept in ``_NodeTagCache`` instead; see the module docstring
-        for why this matters (losing ``TAG_RAY_LAUNCH_CONFIG`` makes every
-        node look permanently out-of-date to Ray).
+        (which always prefers the derived value).         Mutable tags (e.g. ``TAG_RAY_RUNTIME_CONFIG`` and
+        ``TAG_RAY_NODE_STATUS``) remain in ``_NodeTagCache``. The immutable
+        ``TAG_RAY_LAUNCH_CONFIG`` is supplied at workspace creation and read
+        from its description.
         """
-        self._node_tag_cache.update(node_id, tags)
+        mutable_tags = {key: value for key, value in tags.items() if key not in _IMMUTABLE_LAUNCH_TAGS}
+        self._node_tag_cache.update(node_id, mutable_tags)
 
     async def _terminate_nodes(self, node_ids: list[str]) -> None:
         async with ResearchCloudClient.from_env() as client:

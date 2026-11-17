@@ -1148,12 +1148,7 @@ class TestNodeTags:
 
 
 class TestNodeTagCache:
-    """Covers persisting mutable Ray tags (e.g. TAG_RAY_LAUNCH_CONFIG) that
-    SRC workspaces have nowhere to store, since losing them makes every
-    node look permanently out-of-date to Ray's `_should_create_new_head`
-    and causes `ray up` to destroy and recreate an otherwise healthy node
-    on every invocation.
-    """
+    """Covers persisting mutable Ray tags that SRC cannot update."""
 
     def test_set_node_tags_persists_and_is_merged_into_node_tags(self):
         provider = _provider()
@@ -1161,13 +1156,13 @@ class TestNodeTagCache:
 
         with _patched_from_env(fake_client):
             provider.non_terminated_nodes({})
-            provider.set_node_tags("ws-1", {TAG_RAY_LAUNCH_CONFIG: "hash-123"})
+            provider.set_node_tags("ws-1", {"mutable-test-tag": "value"})
 
             assert provider.node_tags("ws-1") == {
                 TAG_RAY_CLUSTER_NAME: CLUSTER_NAME,
                 TAG_RAY_USER_NODE_TYPE: "head",
                 TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
-                TAG_RAY_LAUNCH_CONFIG: "hash-123",
+                "mutable-test-tag": "value",
             }
 
     def test_derived_identity_tags_win_over_a_stale_cached_value(self):
@@ -1192,29 +1187,53 @@ class TestNodeTagCache:
         provider_a = _provider()
         with _patched_from_env(fake_client):
             provider_a.non_terminated_nodes({})
-            provider_a.set_node_tags("ws-1", {TAG_RAY_LAUNCH_CONFIG: "hash-123"})
+            provider_a.set_node_tags("ws-1", {"mutable-test-tag": "value"})
 
         provider_b = _provider()
         with _patched_from_env(fake_client):
-            assert provider_b.node_tags("ws-1")[TAG_RAY_LAUNCH_CONFIG] == "hash-123"
+            assert provider_b.node_tags("ws-1")["mutable-test-tag"] == "value"
 
-    def test_create_node_caches_the_tags_ray_passed_in(self):
+    def test_create_node_stores_immutable_launch_tags_in_description(self):
         provider = _provider()
-        created_workspace = {"id": "ws-1", "name": "node-1", "status": "running"}
-        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={"ws-1": created_workspace})
-        fake_client.workspaces.build_create_payload_from_names.side_effect = (
-            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+        created_workspace = _head_workspace("ws-1")
+        fake_client = _FakeClient(
+            co={"id": "co-1"}, workspaces=[created_workspace], get_by_id={"ws-1": created_workspace}
         )
-        fake_client.workspaces.create.side_effect = [created_workspace]
+        fake_client.workspaces.build_create_payload_from_names.side_effect = (
+            lambda **kwargs: SimpleNamespace(
+                payload={"name": kwargs["workspace_name"], "description": kwargs["description"]}
+            )
+        )
+
+        async def create_workspace(payload):
+            created_workspace["description"] = payload["description"]
+            return created_workspace.copy()
+
+        fake_client.workspaces.create.side_effect = create_workspace
         tags = {
             TAG_RAY_USER_NODE_TYPE: "head",
             TAG_RAY_NODE_KIND: NODE_KIND_HEAD,
             TAG_RAY_LAUNCH_CONFIG: "hash-abc",
+            "mutable-test-tag": "mutable",
         }
 
         with _patched_from_env(fake_client):
             provider.create_node({}, tags, 1)
             assert provider.node_tags("ws-1")[TAG_RAY_LAUNCH_CONFIG] == "hash-abc"
+            assert provider.node_tags("ws-1")["mutable-test-tag"] == "mutable"
+
+        assert created_workspace["description"] == (
+            'src-ray-provider-tags:v1:{"ray-launch-config":"hash-abc"}'
+        )
+        assert TAG_RAY_LAUNCH_CONFIG not in provider._node_tag_cache.get("ws-1")
+        assert provider._node_tag_cache.get("ws-1")["mutable-test-tag"] == "mutable"
+
+        # A separate provider instance can recover the launch tag from the
+        # workspace response without sharing the local mutable-tag cache.
+        provider_b = _provider()
+        with _patched_from_env(fake_client):
+            assert provider_b.non_terminated_nodes({TAG_RAY_LAUNCH_CONFIG: "hash-abc"}) == ["ws-1"]
+            assert provider_b.node_tags("ws-1")[TAG_RAY_LAUNCH_CONFIG] == "hash-abc"
 
     def test_terminate_node_discards_its_cached_tags(self):
         provider = _provider()
@@ -1223,7 +1242,7 @@ class TestNodeTagCache:
 
         with _patched_from_env(fake_client):
             provider.non_terminated_nodes({})
-            provider.set_node_tags("ws-1", {TAG_RAY_LAUNCH_CONFIG: "hash-123"})
+            provider.set_node_tags("ws-1", {"mutable-test-tag": "value"})
             provider.terminate_node("ws-1")
 
         fake_client_after = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={})
@@ -1271,7 +1290,9 @@ class TestCreateNode:
         workspaces = []
         fake_client = _FakeClient(co={"id": "co-1"}, workspaces=workspaces)
         fake_client.workspaces.build_create_payload_from_names.side_effect = (
-            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+            lambda **kwargs: SimpleNamespace(
+                payload={"name": kwargs["workspace_name"], "description": kwargs["description"]}
+            )
         )
         workspace_visible = threading.Event()
         continue_submission = threading.Event()
@@ -1279,6 +1300,7 @@ class TestCreateNode:
 
         async def create_workspace(payload):
             workspace = _worker_workspace("ws-1", status="running", name=payload["name"])
+            workspace["description"] = payload["description"]
             workspaces.append(workspace)
             workspace_visible.set()
             if not continue_submission.wait(timeout=10):
@@ -1331,13 +1353,16 @@ class TestCreateNode:
         workspaces = []
         fake_client = _FakeClient(co={"id": "co-1"}, workspaces=workspaces)
         fake_client.workspaces.build_create_payload_from_names.side_effect = (
-            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+            lambda **kwargs: SimpleNamespace(
+                payload={"name": kwargs["workspace_name"], "description": kwargs["description"]}
+            )
         )
         creation_blocked = threading.Event()
         continue_creation = threading.Event()
 
         async def create_workspace(payload):
             workspace = _worker_workspace(f"ws-{len(workspaces) + 1}", status="creating", name=payload["name"])
+            workspace["description"] = payload["description"]
             workspaces.append(workspace)
             return workspace.copy()
 
@@ -1451,7 +1476,9 @@ class TestCreateNode:
         running = {"id": "ws-1", "name": "node-1", "status": "running"}
         fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={})
         fake_client.workspaces.build_create_payload_from_names.side_effect = (
-            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+            lambda **kwargs: SimpleNamespace(
+                payload={"name": kwargs["workspace_name"], "description": kwargs["description"]}
+            )
         )
         fake_client.workspaces.create.return_value = creating
         fake_client.workspaces.get = AsyncMock(side_effect=[creating, pending, running])
@@ -1477,7 +1504,9 @@ class TestCreateNode:
         fake_loop = SimpleNamespace(time=lambda: clock.now)
         fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={})
         fake_client.workspaces.build_create_payload_from_names.side_effect = (
-            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
+            lambda **kwargs: SimpleNamespace(
+                payload={"name": kwargs["workspace_name"], "description": kwargs["description"]}
+            )
         )
         fake_client.workspaces.create.return_value = creating
         fake_client.workspaces.get = AsyncMock(return_value=creating)
@@ -1499,7 +1528,10 @@ class TestCreateNode:
             provider.create_node({}, tags, 1)
 
         assert fake_client.workspaces.get.await_count == 1
-        assert provider._node_tag_cache.get("ws-1")[TAG_RAY_LAUNCH_CONFIG] == "launch-hash"
+        assert TAG_RAY_LAUNCH_CONFIG not in provider._node_tag_cache.get("ws-1")
+        assert fake_client.workspaces.build_create_payload_from_names.await_args.kwargs["description"] == (
+            'src-ray-provider-tags:v1:{"ray-launch-config":"launch-hash"}'
+        )
 
     def test_creates_requested_count_sequentially_in_one_client_session(self):
         provider = _provider()
