@@ -1725,7 +1725,7 @@ class TestResumePausedWorkspaces:
             "head": {"size_flavour_name": "2 Core - 8 GB", "catalog_item_name": DEFAULT_HEAD_CATALOG_ITEM_NAME},
             "worker": {"size_flavour_name": "4 Core - 16 GB"},
         }
-        with pytest.raises(ValueError, match="Ray Head \\(autoscaling\\)"):
+        with pytest.raises(ValueError, match="Ray Head Node \\(autoscaling\\)"):
             _provider(resume_paused_workspaces=True, node_types=config)
 
     @pytest.mark.parametrize("value", [0, -1, True, float("inf")])

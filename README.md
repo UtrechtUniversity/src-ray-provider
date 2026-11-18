@@ -9,7 +9,7 @@ Ray autoscaler node provider for SURF ResearchCloud (SRC) (read more [here](http
 ### Prerequisites
 
 - A ResearchCloud CO with the "Ray Head Node" and "Ray Worker" Catalog Items available.
-- For paused-workspace reuse, the "Ray Head (autoscaling)" Catalog Item must
+- For paused-workspace reuse, the "Ray Head Node (autoscaling)" Catalog Item must
   also be available.
 - In this CO, create a CO secret called `RAY_SRC_TOKEN` and fill it with an SRC API key.
 
@@ -53,7 +53,7 @@ The `provider` block also requires `co_name` and `wallet_name`. Ray's
 `head_node_type` and `available_node_types` are generated from the size
 flavours available for the `Ray Head Node` and `Ray Worker` catalog items on
 the configured cloud. With paused-workspace reuse enabled, head flavours are
-instead discovered from `Ray Head (autoscaling)`. The smallest-CPU head flavour is generated as `head`
+instead discovered from `Ray Head Node (autoscaling)`. The smallest-CPU head flavour is generated as `head`
 and selected by default, and each generated worker node type uses the
 top-level `max_workers` limit.
 This catalog lookup happens before Ray validates the configuration during
@@ -86,7 +86,7 @@ To customize the default `head` through `available_node_types.head`, also set
 Other generated node type names use a lowercase `head_` or `worker_` prefix
 followed by the normalized size-flavour name. `node_config.catalog_item_name`
 can be overridden per node type; the default remains `Ray Head Node` (or
-`Ray Head (autoscaling)` with reuse enabled) or `Ray Worker` according to the
+`Ray Head Node (autoscaling)` with reuse enabled) or `Ray Worker` according to the
 generated type.
 
 ### Reusing paused workspaces
@@ -122,7 +122,7 @@ component's systemd services start Ray and the autoscaler, so the provider
 replaces global and per-node-type `worker_setup_commands` with empty lists and
 replaces both `worker_start_ray_commands` and `head_start_ray_commands` with a
 no-op. This also suppresses shared `setup_commands` on workers; head setup is
-unchanged. The selected head type must use `Ray Head (autoscaling)`. Both
+unchanged. The selected head type must use `Ray Head Node (autoscaling)`. Both
 catalog items must support these optional parameters and systemd services.
 
 On the same machine and account, workspace selection, submission, and pausing
