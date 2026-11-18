@@ -16,7 +16,7 @@ duplication for avoiding any persisted/free-text tag storage:
   validated at startup. SRC catalog items are role-specific (distinct head
   vs. worker offerings), so the default catalog item name also depends on
   whether a node type is the configured ``head_node_type``. With workspace
-  reuse enabled, the head uses ``Ray Head (autoscaling)`` instead;
+  reuse enabled, the head uses ``Ray Head Node (autoscaling)`` instead;
   it can still be overridden per node type via
   ``available_node_types.<type>.node_config.catalog_item_name``.
 - ``TAG_RAY_NODE_KIND`` is a pure function of the derived node type versus
@@ -114,7 +114,7 @@ from researchcloud.utils.flavours import match_size_flavour, parse_size_flavour,
 
 
 DEFAULT_HEAD_CATALOG_ITEM_NAME = "Ray Head Node"
-AUTOSCALING_HEAD_CATALOG_ITEM_NAME = "Ray Head (autoscaling)"
+AUTOSCALING_HEAD_CATALOG_ITEM_NAME = "Ray Head Node (autoscaling)"
 DEFAULT_WORKER_CATALOG_ITEM_NAME = "Ray Worker"
 DEFAULT_OS_FLAVOUR_NAME = "Ubuntu 24.04"
 DEFAULT_WORKSPACE_CREATION_TIMEOUT = 2400
