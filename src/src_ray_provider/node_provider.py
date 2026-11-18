@@ -1443,7 +1443,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             return None
         field = "local_ip" if private else "ip"
         address = resource_meta.get(field)
-        return address if isinstance(address, str) else ""
+        return address if isinstance(address, str) else None
 
     def internal_ip(self, node_id: str) -> str:
         """Return the private address used for head-to-worker SSH."""
