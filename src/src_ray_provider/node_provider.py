@@ -1440,7 +1440,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         """Return a workspace's public or private address when assigned."""
         resource_meta = workspace.get("resource_meta")
         if not isinstance(resource_meta, Mapping):
-            return ""
+            return None
         field = "local_ip" if private else "ip"
         address = resource_meta.get(field)
         return address if isinstance(address, str) else ""
@@ -1449,12 +1449,12 @@ class ResearchCloudNodeProvider(NodeProvider):
         """Return the private address used for head-to-worker SSH."""
         workspace = self._get_cached_or_fetch(node_id)
         if workspace is None:
-            return ""
+            return None
         return self._workspace_ip(workspace, private=True)
 
     def external_ip(self, node_id: str) -> str:
         """Return the public address used by Ray's driver for initial SSH."""
         workspace = self._get_cached_or_fetch(node_id)
         if workspace is None:
-            return ""
+            return None
         return self._workspace_ip(workspace, private=False)

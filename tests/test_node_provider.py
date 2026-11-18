@@ -1328,13 +1328,13 @@ class TestNodeAddresses:
             assert provider.external_ip("ws-1") == ""
             assert provider.internal_ip("ws-1") == ""
 
-    def test_returns_empty_string_for_a_missing_workspace(self):
+    def test_returns_none_for_a_missing_workspace(self):
         provider = _provider()
         fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[], get_by_id={})
 
         with _patched_from_env(fake_client):
-            assert provider.external_ip("missing") == ""
-            assert provider.internal_ip("missing") == ""
+            assert provider.external_ip("missing") is None
+            assert provider.internal_ip("missing") is None 
 
 
 class TestCreateNode:
