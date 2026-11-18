@@ -1356,7 +1356,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             if not self._belongs_to_cluster(workspace):
                 continue
             if tag_filters:
-                node_tags = self._node_tags_for_workspace(workspace)
+                node_tags = self._merged_node_tags(workspace)
                 if any(node_tags.get(key) != value for key, value in tag_filters.items()):
                     continue
             matching_node_ids.append(workspace_id)
@@ -1388,7 +1388,11 @@ class ResearchCloudNodeProvider(NodeProvider):
         workspace = self._get_cached_or_fetch(node_id)
         if workspace is None:
             return {}
-        tags = self._node_tag_cache.get(node_id)
+        return self._merged_node_tags(workspace)
+
+    def _merged_node_tags(self, workspace: Mapping[str, Any]) -> dict[str, str]:
+        """Cached mutable tags overlaid with workspace-derived tags (which win)."""
+        tags = self._node_tag_cache.get(self._workspace_id(workspace))
         tags.update(self._node_tags_for_workspace(workspace))
         return tags
 

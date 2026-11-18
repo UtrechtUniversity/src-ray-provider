@@ -1021,6 +1021,18 @@ class TestNonTerminatedNodes:
         with _patched_from_env(fake_client):
             assert provider.non_terminated_nodes({TAG_RAY_USER_NODE_TYPE: "worker"}) == []
 
+    def test_tag_filters_match_cached_mutable_tags(self):
+        provider = _provider()
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[_head_workspace("ws-head")])
+        provider._node_tag_cache.update("ws-head", {"ray-node-status": "uninitialized"})
+        head_filter = {TAG_RAY_NODE_KIND: NODE_KIND_HEAD}
+
+        with _patched_from_env(fake_client):
+            assert provider.non_terminated_nodes({**head_filter, "ray-node-status": "uninitialized"}) == ["ws-head"]
+            assert provider.non_terminated_nodes({**head_filter, "ray-node-status": "up-to-date"}) == []
+            provider.set_node_tags("ws-head", {"ray-node-status": "up-to-date"})
+            assert provider.non_terminated_nodes({**head_filter, "ray-node-status": "up-to-date"}) == ["ws-head"]
+
 
 class TestExplicitHeadWorkspace:
     def test_discovers_head_by_id_and_workers_by_name_with_tag_filters(self):
