@@ -89,6 +89,15 @@ can be overridden per node type; the default remains `Ray Head Node` (or
 `Ray Head Node (autoscaling)` with reuse enabled) or `Ray Worker` according to the
 generated type.
 
+Paused and pausing workspaces are excluded from Ray's active node discovery,
+whether or not reuse is enabled. With reuse disabled, if a replacement is
+needed, a new workspace is created instead of resuming a manually paused
+worker. Such a paused workspace is also excluded from ordinary `ray down`
+discovery and must be deleted manually if no longer needed. If manually
+resumed, it is discovered again on refresh and may be subject to Ray's normal
+scaling decisions; manually resuming does not guarantee that the Ray worker
+process is running.
+
 ### Reusing paused workspaces
 
 Opt in to pause and reuse workspaces instead of deleting them:

@@ -955,6 +955,58 @@ class TestNonTerminatedNodes:
         with _patched_from_env(fake_client):
             assert provider.non_terminated_nodes({}) == ["ws-running"]
 
+    @pytest.mark.parametrize("reuse", [False, True])
+    def test_refresh_tracks_manually_paused_and_resumed_worker(self, reuse):
+        provider = _provider(resume_paused_workspaces=reuse)
+        running = _worker_workspace("ws-worker")
+        running["resource_meta"]["local_ip"] = "10.0.0.11"
+        pausing = {**running, "status": "pausing"}
+        paused = {**running, "status": "paused"}
+        resuming = {**running, "status": "resuming"}
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[])
+        fake_client.workspaces.list.side_effect = [[running], [pausing], [paused], [resuming], [running]]
+
+        with _patched_from_env(fake_client):
+            assert provider.non_terminated_nodes({}) == ["ws-worker"]
+            assert provider.is_running("ws-worker")
+            assert provider.internal_ip("ws-worker") == "10.0.0.11"
+            for status in ("pausing", "paused"):
+                assert provider.non_terminated_nodes({TAG_RAY_NODE_KIND: NODE_KIND_WORKER}) == [], status
+                assert provider.is_terminated("ws-worker"), status
+                assert not provider.is_running("ws-worker"), status
+                assert provider.internal_ip("ws-worker") is None, status
+            assert provider.non_terminated_nodes({}) == ["ws-worker"]
+            assert not provider.is_terminated("ws-worker")
+            assert not provider.is_running("ws-worker")
+            assert provider.non_terminated_nodes({}) == ["ws-worker"]
+            assert provider.is_running("ws-worker")
+            assert provider.internal_ip("ws-worker") == "10.0.0.11"
+
+    @pytest.mark.parametrize("min_workers,demand", [(1, []), (0, [{"CPU": 2}])])
+    @pytest.mark.parametrize("status", ["pausing", "paused"])
+    def test_paused_worker_does_not_satisfy_autoscaler_capacity(self, min_workers, demand, status):
+        provider = _provider()
+        head = _head_workspace("ws-head")
+        head["resource_meta"]["local_ip"] = "10.0.0.10"
+        worker = _worker_workspace("ws-worker", status=status)
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[head, worker])
+        node_types = {
+            "head": {"min_workers": 0, "max_workers": 0, "resources": {}},
+            "worker": {"min_workers": min_workers, "max_workers": 6, "resources": {"CPU": 2}},
+        }
+
+        with _patched_from_env(fake_client):
+            nodes = provider.non_terminated_nodes({})
+            scheduler = ResourceDemandScheduler(provider, node_types, 6, "head", 1)
+            launches, unfulfilled = scheduler.get_nodes_to_launch(
+                nodes, {}, demand, {"10.0.0.10": {}}, [],
+                {"10.0.0.10": {}}, [], NodeAvailabilitySummary({}),
+            )
+
+        assert nodes == ["ws-head"]
+        assert launches == {"worker": 1}
+        assert unfulfilled == []
+
     def test_excludes_workspaces_belonging_to_a_different_cluster(self):
         provider = _provider()
         fake_client = _FakeClient(
@@ -1858,9 +1910,10 @@ class TestResumePausedWorkspaces:
         assert "Ignoring malformed Ray tags in workspace description" in caplog.text
 
     @pytest.mark.parametrize("reuse,status,inactive", [
-        (False, "paused", False), (False, "pausing", False),
+        (False, "paused", True), (False, "pausing", True),
         (True, "paused", True), (True, "pausing", True),
         (False, "running", False), (True, "running", False),
+        (False, "creating", False), (True, "resuming", False),
         (False, "deleted", True), (True, "deleted", True),
     ])
     def test_discovery_and_is_terminated_agree(self, reuse, status, inactive):

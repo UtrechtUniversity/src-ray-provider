@@ -1277,9 +1277,7 @@ class ResearchCloudNodeProvider(NodeProvider):
 
     def _is_inactive_workspace(self, workspace: Mapping[str, Any]) -> bool:
         status = self._workspace_status(workspace)
-        return is_workspace_terminal_status(status) or (
-            self.resume_paused_workspaces and status in {"paused", "pausing"}
-        )
+        return is_workspace_terminal_status(status) or status in {"paused", "pausing"}
 
     async def _list_workspaces(self) -> list[dict[str, Any]]:
         async with ResearchCloudClient.from_env() as client:
