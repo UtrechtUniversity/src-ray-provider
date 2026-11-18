@@ -128,7 +128,6 @@ _WORKSPACE_NAME_MAX_LENGTH = 100
 logger = logging.getLogger(__name__)
 
 NODE_TAG_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "node_tags"
-_PROVISIONING_STATUSES = frozenset({"creating", "resuming"})
 SSH_KEY_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "ssh_keys"
 _WORKSPACE_TAGS_DESCRIPTION_PREFIX = "src-ray-provider-tags:v1:"
 _IMMUTABLE_LAUNCH_TAGS = frozenset({TAG_RAY_LAUNCH_CONFIG})
@@ -1353,11 +1352,6 @@ class ResearchCloudNodeProvider(NodeProvider):
         matching_node_ids = []
         for workspace_id, workspace in current_workspaces.items():
             if self._is_inactive_workspace(workspace):
-                continue
-            # Ray starts SSH setup for any listed node. While SRC is still provisioning the
-            # VM, sshd rejects logins (no ray user or key yet), and repeated failures get
-            # the head banned by fail2ban. create_node() blocks until the workspace runs.
-            if self._workspace_status(workspace) in _PROVISIONING_STATUSES:
                 continue
             if not self._belongs_to_cluster(workspace):
                 continue
