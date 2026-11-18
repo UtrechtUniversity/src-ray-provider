@@ -1318,6 +1318,18 @@ class TestNodeTagCache:
 
 
 class TestNodeAddresses:
+    @pytest.mark.parametrize("status", ["creating", "resuming", "paused", "updating", "failed"])
+    def test_returns_no_addresses_for_non_running_workspaces(self, status):
+        provider = _provider()
+        workspace = _worker_workspace("ws-1", status=status)
+        workspace["resource_meta"].update({"ip": "145.38.195.241", "local_ip": "10.10.10.93"})
+        fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[workspace])
+
+        with _patched_from_env(fake_client):
+            provider.non_terminated_nodes({})
+            assert provider.external_ip("ws-1") is None
+            assert provider.internal_ip("ws-1") is None
+
     def test_returns_public_and_private_addresses_from_resource_metadata(self):
         provider = _provider()
         workspace = _worker_workspace("ws-1")

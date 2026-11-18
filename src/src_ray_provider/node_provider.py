@@ -1440,7 +1440,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         asyncio.run(self._terminate_nodes(node_ids))
 
     @staticmethod
-    def _workspace_ip(workspace: Mapping[str, Any], *, private: bool) -> str:
+    def _workspace_ip(workspace: Mapping[str, Any], *, private: bool) -> str | None:
         """Return a workspace's public or private address when assigned."""
         resource_meta = workspace.get("resource_meta")
         if not isinstance(resource_meta, Mapping):
@@ -1449,16 +1449,16 @@ class ResearchCloudNodeProvider(NodeProvider):
         address = resource_meta.get(field)
         return address if isinstance(address, str) else None
 
-    def internal_ip(self, node_id: str) -> str:
-        """Return the private address used for head-to-worker SSH."""
+    def internal_ip(self, node_id: str) -> str | None:
+        """Return the private SSH address only when the workspace is running."""
         workspace = self._get_cached_or_fetch(node_id)
-        if workspace is None:
+        if workspace is None or self._workspace_status(workspace) != "running":
             return None
         return self._workspace_ip(workspace, private=True)
 
-    def external_ip(self, node_id: str) -> str:
-        """Return the public address used by Ray's driver for initial SSH."""
+    def external_ip(self, node_id: str) -> str | None:
+        """Return the public SSH address only when the workspace is running."""
         workspace = self._get_cached_or_fetch(node_id)
-        if workspace is None:
+        if workspace is None or self._workspace_status(workspace) != "running":
             return None
         return self._workspace_ip(workspace, private=False)
