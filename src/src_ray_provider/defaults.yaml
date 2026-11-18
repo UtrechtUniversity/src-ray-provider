@@ -9,7 +9,7 @@ head_start_ray_commands:
     --disable-usage-stats
     --node-ip-address "$RAY_NODE_IP_ADDRESS"
     --head
-    --port "$RAY_PORT"
+    --port "${RAY_PORT:-6379}"
     --dashboard-port "$RAY_DASHBOARD_PORT"
     --num-cpus=0
     --autoscaling-config=ray_bootstrap_config.yaml
@@ -21,7 +21,7 @@ worker_start_ray_commands:
    source ray_worker.env && ray start
    --disable-usage-stats
    --node-ip-address "$RAY_NODE_IP_ADDRESS"
-   --address "$RAY_HEAD_IP:$RAY_PORT"
+   --address "$RAY_HEAD_IP:${RAY_PORT:-6379}"
 
 initialization_commands: 
 head_setup_commands: []
