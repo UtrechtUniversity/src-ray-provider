@@ -41,10 +41,10 @@ rsync_exclude: []
 rsync_filter: []
 
 # Global cap on worker nodes across the whole cluster. During bootstrap, the
-# provider creates a Ray node type for each size flavour in the Ray Head Node
-# and Ray Worker catalog items before Ray validates the configuration. The
-# smallest-CPU head flavour is selected by default; define head_node_type /
-# available_node_types below to override.
+# provider creates Ray node types for CPU-only head and CPU/GPU worker size
+# flavours before Ray validates the configuration. The smallest-CPU head
+# flavour is selected by default; define head_node_type / available_node_types
+# below to override.
 max_workers: 4
 
 idle_timeout_minutes: 10 # After how many minutes of idleness a worker node should be terminated

@@ -28,6 +28,7 @@ from ray.autoscaler.tags import (
     TAG_RAY_NODE_KIND,
     TAG_RAY_USER_NODE_TYPE,
 )
+from researchcloud.client import ResearchCloudClient
 from researchcloud.config import DEFAULT_CLOUD_NAME
 from researchcloud.errors import ApiError
 from src_ray_provider.node_provider import (
@@ -37,6 +38,7 @@ from src_ray_provider.node_provider import (
     DEFAULT_WORKER_CATALOG_ITEM_NAME,
     DEFAULT_WORKSPACE_CREATION_TIMEOUT,
     ResearchCloudNodeProvider,
+    _size_flavour_resources,
     _write_json_object,
     _workspace_tags_description,
     sanitize_name_component,
@@ -194,6 +196,27 @@ def test_catalog_item_name_defaults_by_role():
     assert provider._node_type_configs["worker"]["catalog_item_name"] == DEFAULT_WORKER_CATALOG_ITEM_NAME
 
 
+@pytest.mark.parametrize(
+    ("name", "resources"),
+    [
+        ("A10 - 1 GPU", {"GPU": 1}),
+        ("A10 - 2 GPU", {"GPU": 2}),
+        ("A10 - 4 GPU", {"GPU": 4}),
+        ("RTX2080 - 1 GPU", {"GPU": 1}),
+        ("RTX2080 - 2 GPU", {"GPU": 2}),
+        ("RTX 6000 - 1 GPU", {"GPU": 1}),
+        ("RTX 6000 - 2 GPU", {"GPU": 2}),
+        ("Other accelerator - 3 gpu", {"GPU": 3}),
+        ("GPU 4 Core - 1x A100", {"CPU": 4, "GPU": 1}),
+        ("4 Core - 16 GB", {"CPU": 4}),
+        ("Unknown", None),
+        ("RTX 6000 - 0 GPU", None),
+    ],
+)
+def test_size_flavour_resources_preserves_only_known_resources(name, resources):
+    assert _size_flavour_resources(name) == resources
+
+
 class TestBootstrapConfig:
     """``bootstrap_config`` lets cluster.yaml authors skip manually duplicating
     ``head_node_type``/``node_types`` under ``provider:`` (see module
@@ -225,6 +248,7 @@ class TestBootstrapConfig:
                     size_flavours = [
                         "2 Core - 8 GB",
                         "GPU 4 Core - 1x A100",
+                        "A10 - 1 GPU",
                         "1 Core - 8 GB RAM",
                     ]
                 else:
@@ -232,6 +256,9 @@ class TestBootstrapConfig:
                         "2 Core - 8 GB",
                         "4 Core - 16 GB",
                         "8 Core - 32 GB RAM",
+                        "GPU 4 Core - 1x A100",
+                        "A10 - 1 GPU",
+                        "RTX 6000 - 2 GPU",
                     ]
                 return (
                     {"flavours": [{"category": "size", "name": name} for name in size_flavours]},
@@ -388,7 +415,9 @@ class TestBootstrapConfig:
                 "size_flavour_name": "1 Core - 8 GB RAM",
             },
         }
-        assert result["available_node_types"]["head_gpu_4_core_1x_a100"]["resources"] == {
+        assert "head_gpu_4_core_1x_a100" not in result["available_node_types"]
+        assert "head_a10_1_gpu" not in result["available_node_types"]
+        assert result["available_node_types"]["worker_gpu_4_core_1x_a100"]["resources"] == {
             "CPU": 4,
             "GPU": 1,
         }
@@ -398,6 +427,55 @@ class TestBootstrapConfig:
         )
         assert "head_1_core_8_gb_ram" not in result["available_node_types"]
         assert result["provider"]["head_node_type"] == "head"
+
+    def test_gpu_flavours_without_cpu_counts_can_be_overridden_for_autoscaling(self, caplog):
+        config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
+        config["available_node_types"] = {
+            "worker_a10_1_gpu": {"resources": {"CPU": 8}},
+        }
+
+        result = _bootstrap_config(config, no_config_cache=True)
+        node_types = result["available_node_types"]
+
+        assert node_types["worker_a10_1_gpu"]["resources"] == {"CPU": 8, "GPU": 1}
+        assert node_types["worker_a10_1_gpu"]["node_config"]["size_flavour_name"] == "A10 - 1 GPU"
+        assert node_types["worker_rtx_6000_2_gpu"]["resources"] == {"GPU": 2}
+        assert result["provider"]["node_types"]["worker_rtx_6000_2_gpu"]["size_flavour_name"] == (
+            "RTX 6000 - 2 GPU"
+        )
+        warnings = [record.getMessage() for record in caplog.records if record.name == "src_ray_provider.node_provider"]
+        assert len(warnings) == 1
+        assert "worker_rtx_6000_2_gpu" in warnings[0]
+        assert "unknown CPU count" in warnings[0]
+
+        scheduler = ResourceDemandScheduler(None, node_types, 4, result["head_node_type"], 1)
+        assert scheduler.is_feasible({"CPU": 8, "GPU": 1})
+        assert not scheduler.is_feasible({"CPU": 1, "GPU": 2})
+
+    @pytest.mark.parametrize("reuse", [False, True])
+    def test_no_cpu_only_head_flavours_fails(self, monkeypatch, reuse):
+        fake_client = ResearchCloudClient.from_env()
+        fake_client.resolve_offering_and_flavours = AsyncMock(return_value=(
+            {"flavours": [
+                {"category": "size", "name": "RTX 6000 - 2 GPU"},
+                {"category": "size", "name": "A10 - 1 GPU"},
+                {"category": "size", "name": "GPU 4 Core - 1x A100"},
+            ]},
+            None,
+            None,
+        ))
+        monkeypatch.setattr("src_ray_provider.node_provider.ResearchCloudClient.from_env", lambda: fake_client)
+        config = {
+            "cluster_name": CLUSTER_NAME,
+            "provider": {
+                "co_name": "Example CO",
+                "wallet_name": "Example Wallet",
+                "resume_paused_workspaces": reuse,
+            },
+        }
+
+        with pytest.raises(ValueError, match="No usable CPU-only size flavours"):
+            ResearchCloudNodeProvider.bootstrap_config(config)
 
     def test_partial_head_override_merges_with_smallest_head_flavour(self):
         cluster_config = {

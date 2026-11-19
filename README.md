@@ -53,9 +53,11 @@ The `provider` block also requires `co_name` and `wallet_name`. Ray's
 `head_node_type` and `available_node_types` are generated from the size
 flavours available for the `Ray Head Node` and `Ray Worker` catalog items on
 the configured cloud. With paused-workspace reuse enabled, head flavours are
-instead discovered from `Ray Head Node (autoscaling)`. The smallest-CPU head flavour is generated as `head`
-and selected by default, and each generated worker node type uses the
-top-level `max_workers` limit.
+instead discovered from `Ray Head Node (autoscaling)`. Only CPU-only head
+flavours are generated; the flavour with the smallest known CPU count becomes
+`head` and is selected by default. If no usable CPU-only head flavour is
+available, discovery fails. Worker flavours may include GPUs, and each
+generated worker node type uses the top-level `max_workers` limit.
 This catalog lookup happens before Ray validates the configuration during
 `ray up`, so `RESEARCH_CLOUD_TOKEN` must be available when bootstrapping the
 cluster. If Ray has cached an earlier configuration, use
@@ -88,6 +90,23 @@ followed by the normalized size-flavour name. `node_config.catalog_item_name`
 can be overridden per node type; the default remains `Ray Head Node` (or
 `Ray Head Node (autoscaling)` with reuse enabled) or `Ray Worker` according to the
 generated type.
+
+Some GPU flavour names, such as `A10 - 1 GPU`, do not specify a CPU count.
+These node types are generated with their GPU count but no CPU count; the
+provider logs a warning unless you supply one. Set `resources.CPU` to the
+actual number of CPUs for each such flavour:
+
+```yaml
+available_node_types:
+  worker_a10_1_gpu:
+    resources:
+      CPU: 8  # Replace with the actual CPU count for this flavour.
+```
+
+Without this setting, Ray cannot scale from zero for tasks that require both
+CPU and GPU resources. Once a worker is running, the autoscaler can learn its
+runtime resources. Flavours with neither a known CPU nor GPU count are
+skipped; define a custom node type with explicit resources if needed.
 
 Paused and pausing workspaces are excluded from Ray's active node discovery,
 whether or not reuse is enabled. With reuse disabled, if a replacement is
