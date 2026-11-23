@@ -12,7 +12,7 @@ provider:
   # network_name_hint: example-network # If there are multiple networks, this helps the provider choose the correct one
   # idle_timeout_minutes: 3 # After how many minutes of idleness a worker node should be terminated
 : true # Attempt to resume or pause nodes instead of creating or deleting new ones
-  # resume_min_ttl_seconds: 86400 # When using resume_paused_workspaces: only resume workspaces with more than 24 hours remaining
+  # resume_min_ttl_seconds: 3600 # When using resume_paused_workspaces: only resume workspaces with more than 1 hours remaining
 
 # The auth block is used to configure SSH access to the cluster nodes.
 # You can leave it out to work with the defaults described below.
