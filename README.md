@@ -139,19 +139,20 @@ missing, invalid, or timezone-less expiry times are not reused.
 Only workspaces previously created with reuse enabled are eligible: their
 creation settings must match, including the SSH public key, Ray and Python
 versions, and, for workers, the current head's private IP. Workspaces created
-without this option are not assumed to have the systemd setup required for
-reuse. An incompatible or near-expiry workspace remains paused and a new one
-is created instead. If `head_workspace_id` is configured, an incompatible
-paused head causes an error rather than creating a different head.
+without this option are not assumed to have the setup required for reuse.
+An incompatible or near-expiry workspace remains paused and a new one is created instead.
+If `head_workspace_id` is configured, an incompatible paused head causes an error
+rather than creating a different head.
 
-With reuse enabled, new workspaces request `do_setup=true`, and workers
-receive the running head's private address as `head_node_address`. The SRC
-component's systemd services start Ray and the autoscaler, so the provider
-replaces global and per-node-type `worker_setup_commands` with empty lists and
-replaces both `worker_start_ray_commands` and `head_start_ray_commands` with a
-no-op. This also suppresses shared `setup_commands` on workers; head setup is
-unchanged. The selected head type must use `Ray Head Node (autoscaling)`. Both
-catalog items must support these optional parameters and systemd services.
+With reuse enabled, new head workspaces request `do_setup=true`: the SRC
+component's systemd service starts Ray and the autoscaler, so the provider
+replaces `head_start_ray_commands` with a no-op. The selected head type must
+use `Ray Head Node (autoscaling)` and support this systemd setup.
+Workers request `do_setup=false` and receive the running head's private address
+as `head_node_address`. Ray manages worker setup and startup on new and resumed
+workers; global and per-node-type worker setup commands are preserved. Ray's
+restart options can change which commands run. The worker catalog item must
+support these optional parameters.
 
 On the same machine and account, workspace selection, submission, and pausing
 are serialized. Across machines, avoiding duplicate claims of a paused

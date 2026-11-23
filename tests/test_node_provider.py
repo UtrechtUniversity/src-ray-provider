@@ -23,9 +23,11 @@ from ray.autoscaler._private.util import hash_launch_conf
 from ray.autoscaler.tags import (
     NODE_KIND_HEAD,
     NODE_KIND_WORKER,
+    STATUS_UP_TO_DATE,
     TAG_RAY_CLUSTER_NAME,
     TAG_RAY_LAUNCH_CONFIG,
     TAG_RAY_NODE_KIND,
+    TAG_RAY_NODE_STATUS,
     TAG_RAY_USER_NODE_TYPE,
 )
 from researchcloud.client import ResearchCloudClient
@@ -97,6 +99,31 @@ def test_provider_configuration_uses_defaults():
         "network_name_hint": None,
         "optional_parameters": EXPECTED_OPTIONAL_PARAMETERS,
     }
+
+
+@pytest.mark.parametrize(
+    ("reuse", "node_type", "expected"),
+    [
+        (False, "controller", "false"),
+        (False, "worker", "false"),
+        (True, "controller", "true"),
+        (True, "worker", "false"),
+    ],
+)
+def test_systemd_setup_is_enabled_only_for_reusable_head(reuse, node_type, expected):
+    provider = ResearchCloudNodeProvider(
+        _provider_config(
+            resume_paused_workspaces=reuse,
+            head_node_type="controller",
+            node_types={
+                "controller": {"size_flavour_name": "2 Core - 8 GB"},
+                "worker": {"size_flavour_name": "4 Core - 16 GB"},
+            },
+        ),
+        CLUSTER_NAME,
+    )
+
+    assert provider._workspace_creation_options(node_type)["optional_parameters"]["do_setup"] == expected
 
 
 def test_provider_configuration_allows_overrides():
@@ -287,32 +314,44 @@ class TestBootstrapConfig:
         assert "ray.worker.default" not in result["available_node_types"]
         assert "_src_node_types_resolved" not in result["provider"]
 
-    def test_ray_bootstrap_configures_systemd_for_reuse(self):
+    def test_ray_bootstrap_configures_systemd_for_reusable_head(self):
         config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
         config["provider"]["resume_paused_workspaces"] = True
 
         result = _bootstrap_config(config, no_config_cache=True)
 
         assert result["worker_setup_commands"] == []
-        assert result["worker_start_ray_commands"] == ["true"]
+        assert result["worker_start_ray_commands"] != ["true"]
+        assert any("ray start" in command for command in result["worker_start_ray_commands"])
         assert result["head_start_ray_commands"] == ["true"]
         assert result["available_node_types"]["head"]["node_config"]["catalog_item_name"] == (
             AUTOSCALING_HEAD_CATALOG_ITEM_NAME
         )
         assert result["provider"]["node_types"]["head"]["catalog_item_name"] == AUTOSCALING_HEAD_CATALOG_ITEM_NAME
 
-    def test_reuse_overrides_worker_setup_commands(self):
+    @pytest.mark.parametrize("reuse", [False, True])
+    def test_bootstrap_preserves_worker_commands(self, reuse):
         config = yaml.safe_load((Path(__file__).parent.parent / "cluster.yaml").read_text())
-        config["provider"]["resume_paused_workspaces"] = True
-        config["worker_setup_commands"] = ["echo not supported"]
+        config["provider"]["resume_paused_workspaces"] = reuse
+        config["worker_setup_commands"] = ["echo worker setup"]
+        config["worker_start_ray_commands"] = ["echo worker start"]
+        config["head_start_ray_commands"] = ["echo head start"]
         config["setup_commands"] = ["echo shared setup"]
         config["available_node_types"] = {
             "worker_4_core_16_gb": {"worker_setup_commands": ["echo node setup"]}
         }
 
         result = _bootstrap_config(config, no_config_cache=True)
-        assert result["worker_setup_commands"] == []
-        assert result["available_node_types"]["worker_4_core_16_gb"]["worker_setup_commands"] == []
+        assert result["worker_setup_commands"] == ["echo shared setup", "echo worker setup"]
+        assert result["available_node_types"]["worker_4_core_16_gb"]["worker_setup_commands"] == [
+            "echo node setup"
+        ]
+        assert result["worker_start_ray_commands"][-1] == "echo worker start"
+        assert any("ray start" in command for command in result["worker_start_ray_commands"])
+        if reuse:
+            assert result["head_start_ray_commands"] == ["true"]
+        else:
+            assert result["head_start_ray_commands"][-1] == "echo head start"
         assert "echo shared setup" in result["head_setup_commands"]
 
     def test_ray_bootstrap_merges_partial_generated_node_type_override(self):
@@ -1912,6 +1951,7 @@ class TestResumePausedWorkspaces:
         head = _autoscaling_head_workspace("head-1")
         head["resource_meta"]["local_ip"] = "10.0.0.10"
         worker = _paused_reusable(provider, "worker", "worker-1", "10.0.0.10")
+        provider.set_node_tags("worker-1", {TAG_RAY_NODE_STATUS: STATUS_UP_TO_DATE})
         fake_client = _FakeClient(co={"id": "co-1"}, workspaces=[head, worker])
 
         async def resume(workspace_id):
@@ -1926,10 +1966,24 @@ class TestResumePausedWorkspaces:
 
         with _patched_from_env(fake_client):
             result = provider.create_node({}, _reuse_tags("worker"), 2)
+            assert TAG_RAY_NODE_STATUS not in provider.node_tags("worker-1")
+
+            autoscaler = StandardAutoscaler.__new__(StandardAutoscaler)
+            autoscaler.provider = provider
+            autoscaler.available_node_types = {"worker": {"worker_setup_commands": ["echo node setup"]}}
+            autoscaler.config = {
+                "worker_setup_commands": ["echo global setup"],
+                "worker_start_ray_commands": ["echo worker start"],
+            }
+            autoscaler.num_successful_updates = {}
+            with patch.object(StandardAutoscaler, "can_update", return_value=True):
+                update = autoscaler.should_update("worker-1")
+            assert update.setup_commands == ["echo node setup"]
+            assert update.ray_start_commands == ["echo worker start"]
 
         assert set(result) == {"worker-1", "worker-2"}
         parameters = fake_client.workspaces.build_create_payload_from_names.await_args.kwargs["optional_parameters"]
-        assert parameters["do_setup"] == "true"
+        assert parameters["do_setup"] == "false"
         assert parameters["head_node_address"] == "10.0.0.10"
         fake_client.workspaces.resume.assert_awaited_once_with("worker-1")
         assert fake_client.workspaces.list.await_count == 2
@@ -1960,7 +2014,6 @@ class TestResumePausedWorkspaces:
             "network_name_hint": None,
             "optional_parameters": {
                 **EXPECTED_OPTIONAL_PARAMETERS,
-                "do_setup": "true",
                 "head_node_address": "10.0.0.10",
             },
         }
@@ -1968,6 +2021,14 @@ class TestResumePausedWorkspaces:
             json.dumps(expected_options, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         assert provider._reuse_configuration("worker", "10.0.0.10") == expected
+
+        expected_options["optional_parameters"]["do_setup"] = "true"
+        previous_configuration = hashlib.sha256(
+            json.dumps(expected_options, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        worker = _paused_reusable(provider, "worker", "worker-1", "10.0.0.10")
+        worker["description"] = _workspace_tags_description(_reuse_tags("worker"), previous_configuration)
+        assert not provider._can_resume_workspace(worker, "worker", _reuse_tags("worker"), expected)
 
     @pytest.mark.parametrize("description", [
         "src-ray-provider-tags:v1:{",

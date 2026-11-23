@@ -596,11 +596,6 @@ class ResearchCloudNodeProvider(NodeProvider):
 
         provider_config = cluster_config.setdefault("provider", {})
         if _resume_enabled(provider_config):
-            cluster_config["worker_setup_commands"] = []
-            for config in cluster_config.get("available_node_types", {}).values():
-                if isinstance(config, dict) and "worker_setup_commands" in config:
-                    config["worker_setup_commands"] = []
-            cluster_config["worker_start_ray_commands"] = ["true"]
             cluster_config["head_start_ray_commands"] = ["true"]
         auth_config = cluster_config["auth"]
         if not isinstance(auth_config, dict):
@@ -801,7 +796,7 @@ class ResearchCloudNodeProvider(NodeProvider):
 
         options["optional_parameters"] = {
             "public_key": self.ray_public_key_data,
-            "do_setup": "true" if self.resume_paused_workspaces else "false",
+            "do_setup": "true" if self.resume_paused_workspaces and node_type == self.head_node_type else "false",
             "version": ray_version.version,
             "python_version": platform.python_version(),
             "packages": "default,client,train,tune,serve", # todo: make this configurable
