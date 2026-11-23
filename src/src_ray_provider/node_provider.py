@@ -133,6 +133,65 @@ _WORKSPACE_TAGS_DESCRIPTION_PREFIX = "src-ray-provider-tags:v1:"
 _IMMUTABLE_LAUNCH_TAGS = frozenset({TAG_RAY_LAUNCH_CONFIG})
 _REUSE_CONFIGURATION_KEY = "src-reuse-configuration"
 
+REUSE_WORKER_START_COMMAND = """\
+wait_for_raylet() {
+    attempts=0
+    while [ "$attempts" -lt 30 ]; do
+        if main_pid=$(systemctl show --property=MainPID --value ray_worker.service); then
+            :
+        else
+            echo "Failed to get ray_worker.service MainPID" >&2
+            return 2
+        fi
+        case "$main_pid" in
+            ''|*[!0-9]*) echo "Invalid ray_worker.service MainPID: $main_pid" >&2; return 2 ;;
+        esac
+        if processes=$(ps -eo ppid=,stat=,comm=); then
+            :
+        else
+            echo "Failed to list processes for ray_worker.service" >&2
+            return 2
+        fi
+        if [ "$main_pid" -ne 0 ]; then
+            if printf '%s\\n' "$processes" | awk -v pid="$main_pid" \
+'$1 == pid && $2 !~ /^Z/ && $3 == "raylet" { found = 1 } END { exit !found }'; then
+                return 0
+            else
+                result=$?
+                if [ "$result" -ne 1 ]; then
+                    echo "Failed to inspect raylet processes" >&2
+                    return 2
+                fi
+            fi
+        fi
+        attempts=$((attempts + 1))
+        sleep 2 || return 2
+    done
+    return 1
+}
+
+sudo -n systemctl start ray_worker.service || exit $?
+if wait_for_raylet; then
+    exit 0
+else
+    result=$?
+fi
+if [ "$result" -ne 1 ]; then
+    exit "$result"
+fi
+echo "No live raylet found for ray_worker.service; restarting it" >&2
+sudo -n systemctl restart ray_worker.service || exit $?
+if wait_for_raylet; then
+    exit 0
+else
+    result=$?
+fi
+if [ "$result" -eq 1 ]; then
+    echo "No live raylet found for ray_worker.service after restart" >&2
+fi
+exit "$result"
+"""
+
 
 def _resume_enabled(provider_config: Mapping[str, Any]) -> bool:
     reuse = provider_config.get("resume_paused_workspaces", False)
@@ -600,7 +659,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             for config in cluster_config.get("available_node_types", {}).values():
                 if isinstance(config, dict) and "worker_setup_commands" in config:
                     config["worker_setup_commands"] = []
-            cluster_config["worker_start_ray_commands"] = ["true"]
+            cluster_config["worker_start_ray_commands"] = [REUSE_WORKER_START_COMMAND]
             cluster_config["head_start_ray_commands"] = ["true"]
         auth_config = cluster_config["auth"]
         if not isinstance(auth_config, dict):

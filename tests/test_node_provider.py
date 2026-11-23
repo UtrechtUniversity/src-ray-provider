@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
@@ -37,6 +39,7 @@ from src_ray_provider.node_provider import (
     DEFAULT_OS_FLAVOUR_NAME,
     DEFAULT_WORKER_CATALOG_ITEM_NAME,
     DEFAULT_WORKSPACE_CREATION_TIMEOUT,
+    REUSE_WORKER_START_COMMAND,
     ResearchCloudNodeProvider,
     _size_flavour_resources,
     _write_json_object,
@@ -294,12 +297,69 @@ class TestBootstrapConfig:
         result = _bootstrap_config(config, no_config_cache=True)
 
         assert result["worker_setup_commands"] == []
-        assert result["worker_start_ray_commands"] == ["true"]
+        assert result["worker_start_ray_commands"] == [REUSE_WORKER_START_COMMAND]
         assert result["head_start_ray_commands"] == ["true"]
         assert result["available_node_types"]["head"]["node_config"]["catalog_item_name"] == (
             AUTOSCALING_HEAD_CATALOG_ITEM_NAME
         )
         assert result["provider"]["node_types"]["head"]["catalog_item_name"] == AUTOSCALING_HEAD_CATALOG_ITEM_NAME
+
+    @pytest.mark.parametrize(
+        "scenario,expected_calls,expected_code",
+        [
+            ("healthy", ["start"], 0),
+            ("slow_start", ["start"], 0),
+            ("dead_then_healthy", ["start", "restart"], 0),
+            ("always_dead", ["start", "restart"], 1),
+            ("start_error", ["start"], 42),
+            ("restart_error", ["start", "restart"], 42),
+            ("show_error", ["start"], 2),
+            ("ps_error", ["start"], 2),
+        ],
+    )
+    def test_reuse_worker_service_recovery(self, tmp_path, scenario, expected_calls, expected_code):
+        config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
+        config["provider"]["resume_paused_workspaces"] = True
+        command = _bootstrap_config(config, no_config_cache=True)["worker_start_ray_commands"][0]
+        scripts = {
+            "sudo": """\
+#!/bin/sh
+[ "$1" = -n ] && [ "$2" = systemctl ] && [ "$4" = ray_worker.service ] || exit 99
+echo "$3" >> "$TEST_DIR/calls"
+if [ "$TEST_SCENARIO" = "${3}_error" ]; then exit 42; fi
+if [ "$3" = restart ]; then : > "$TEST_DIR/restarted"; fi
+""",
+            "systemctl": """\
+#!/bin/sh
+[ "$*" = "show --property=MainPID --value ray_worker.service" ] || exit 99
+if [ "$TEST_SCENARIO" = show_error ]; then exit 1; fi
+echo 123
+""",
+            "ps": """\
+#!/bin/sh
+[ "$*" = "-eo ppid=,stat=,comm=" ] || exit 99
+if [ "$TEST_SCENARIO" = ps_error ]; then exit 1; fi
+echo '999 S raylet'
+echo '123 Z raylet'
+if [ "$TEST_SCENARIO" = healthy ] || {
+    [ "$TEST_SCENARIO" = dead_then_healthy ] && [ -f "$TEST_DIR/restarted" ]
+} || {
+    [ "$TEST_SCENARIO" = slow_start ] && [ -f "$TEST_DIR/slept" ]
+}; then echo '123 S raylet'; fi
+""",
+            "sleep": '#!/bin/sh\n: > "$TEST_DIR/slept"\n',
+        }
+        for name, content in scripts.items():
+            path = tmp_path / name
+            path.write_text(content)
+            path.chmod(0o755)
+        env = {**os.environ, "PATH": f"{tmp_path}:/usr/bin:/bin", "TEST_DIR": str(tmp_path),
+               "TEST_SCENARIO": scenario}
+
+        result = subprocess.run(["/bin/sh", "-c", command], env=env, capture_output=True, text=True)
+
+        assert (tmp_path / "calls").read_text().splitlines() == expected_calls
+        assert result.returncode == expected_code, result.stderr
 
     def test_reuse_overrides_worker_setup_commands(self):
         config = yaml.safe_load((Path(__file__).parent.parent / "cluster.yaml").read_text())

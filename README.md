@@ -148,10 +148,17 @@ With reuse enabled, new workspaces request `do_setup=true`, and workers
 receive the running head's private address as `head_node_address`. The SRC
 component's systemd services start Ray and the autoscaler, so the provider
 replaces global and per-node-type `worker_setup_commands` with empty lists and
-replaces both `worker_start_ray_commands` and `head_start_ray_commands` with a
-no-op. This also suppresses shared `setup_commands` on workers; head setup is
-unchanged. The selected head type must use `Ray Head Node (autoscaling)`. Both
-catalog items must support these optional parameters and systemd services.
+replaces `worker_start_ray_commands` with a systemd recovery check. It starts
+`ray_worker.service` if necessary, then waits up to 60 seconds for a live
+raylet process directly owned by the service's main process. If none appears,
+it restarts the service and waits another 60 seconds; errors and timeouts are
+reported to Ray. An active service with a live raylet is not restarted.
+Process existence does not prove that the raylet is responsive or connected
+to the head. The head start command remains a no-op. This also suppresses
+shared `setup_commands` on workers; head setup is unchanged. The selected head
+type must use `Ray Head Node (autoscaling)`. Both catalog items must support
+these optional parameters and systemd services, and the worker's `ray` user
+must be allowed to start and restart `ray_worker.service` without a password.
 
 On the same machine and account, workspace selection, submission, and pausing
 are serialized. Across machines, avoiding duplicate claims of a paused
