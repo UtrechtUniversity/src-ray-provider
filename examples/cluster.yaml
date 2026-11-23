@@ -48,5 +48,16 @@ rsync_filter: []
 # below to override.
 max_workers: 4
 
+# Override Ray extras per node type. Workers otherwise infer extras from the
+# head's installed Ray dependencies; the head uses its fixed default.
+# head_node_type: head
+# available_node_types:
+#   head:
+#     node_config:
+#       ray_packages: "default,client"
+#   worker_4_core_16_gb:
+#     node_config:
+#       ray_packages: "client,tune"
+
 idle_timeout_minutes: 10 # After how many minutes of idleness a worker node should be terminated.
 # idle_timeout_minutes: 3 # If resume_paused_workspaces is true, you may want to be quicker with idle termination, since paused workspaces can be resumed quickly.

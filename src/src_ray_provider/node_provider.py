@@ -83,11 +83,13 @@ import threading
 import uuid
 import yaml
 from datetime import datetime, timedelta, timezone
+from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from packaging.requirements import Requirement
 
 try:
     import fcntl
@@ -143,6 +145,52 @@ def _resume_enabled(provider_config: Mapping[str, Any]) -> bool:
 
 def _head_catalog_item_name(provider_config: Mapping[str, Any]) -> str:
     return AUTOSCALING_HEAD_CATALOG_ITEM_NAME if _resume_enabled(provider_config) else DEFAULT_HEAD_CATALOG_ITEM_NAME
+
+
+def _infer_worker_ray_packages() -> str:
+    """Infer Ray extras from installed, applicable dependency metadata."""
+    ray_dist = distribution("ray")
+    ray_requirements = [Requirement(item) for item in ray_dist.requires or []]
+
+    def installed(requirement: Requirement, seen: set[tuple[str, tuple[str, ...]]]) -> bool:
+        try:
+            dist = distribution(requirement.name)
+        except PackageNotFoundError:
+            return False
+        if requirement.specifier and not requirement.specifier.contains(dist.version, prereleases=True):
+            return False
+        if not requirement.extras:
+            return True
+
+        key = (requirement.name.lower(), tuple(sorted(requirement.extras)))
+        if key in seen:
+            return True
+        seen = seen | {key}
+        for item in dist.requires or []:
+            dependency = Requirement(item)
+            if dependency.marker is None or any(
+                dependency.marker.evaluate({"extra": extra}) for extra in ("", *requirement.extras)
+            ):
+                if not installed(dependency, seen):
+                    return False
+        return True
+
+    inferred = []
+    for extra in sorted(ray_dist.metadata.get_all("Provides-Extra", [])):
+        requirements = [
+            requirement for requirement in ray_requirements
+            if requirement.marker is not None
+            and requirement.marker.evaluate({"extra": extra})
+            and not requirement.marker.evaluate({"extra": ""})
+        ]
+        if requirements and all(installed(requirement, set()) for requirement in requirements):
+            inferred.append(extra)
+    if not inferred:
+        raise ValueError(
+            "Could not infer any installed Ray extras for workers. The SRC Ray component uses its own "
+            "defaults for an empty packages parameter; set node_config.ray_packages explicitly."
+        )
+    return ",".join(inferred)
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -371,7 +419,7 @@ def _merge_catalog_node_types(
 
 
 def _provider_node_types(available_node_types: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    keys = ("size_flavour_name", "num_cpu", "num_gpu", "gpu_type", "catalog_item_name")
+    keys = ("size_flavour_name", "num_cpu", "num_gpu", "gpu_type", "catalog_item_name", "ray_packages")
     node_types = {}
     for name, config in available_node_types.items():
         node_config = config.get("node_config", {}) if isinstance(config, Mapping) else {}
@@ -734,6 +782,7 @@ class ResearchCloudNodeProvider(NodeProvider):
                 f"reuse requires the head node type to use catalog item {AUTOSCALING_HEAD_CATALOG_ITEM_NAME!r}"
             )
         self._cluster_prefix = f"ray-{sanitize_name_component(cluster_name)}-"
+        self._inferred_worker_ray_packages: str | None = None
 
         self._workspaces: dict[str, dict[str, Any]] = {}
         self._workspaces_lock = threading.RLock()
@@ -785,6 +834,14 @@ class ResearchCloudNodeProvider(NodeProvider):
 
     def _workspace_creation_options(self, node_type: str, head_address: str | None = None) -> dict[str, Any]:
         node_type_config = self._node_type_configs[node_type]
+        if "ray_packages" in node_type_config:
+            ray_packages = node_type_config["ray_packages"]
+        elif node_type == self.head_node_type:
+            ray_packages = "default,client,train,tune,serve"
+        else:
+            if self._inferred_worker_ray_packages is None:
+                self._inferred_worker_ray_packages = _infer_worker_ray_packages()
+            ray_packages = self._inferred_worker_ray_packages
         options = {
             "catalog_item_name": node_type_config["catalog_item_name"],
             "cloud_name": self.cloud_name,
@@ -799,7 +856,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             "do_setup": "true" if self.resume_paused_workspaces and node_type == self.head_node_type else "false",
             "version": ray_version.version,
             "python_version": platform.python_version(),
-            "packages": "default,client,train,tune,serve", # todo: make this configurable
+            "packages": ray_packages,
         }
         if head_address is not None:
             options["optional_parameters"]["head_node_address"] = head_address
@@ -1153,6 +1210,17 @@ class ResearchCloudNodeProvider(NodeProvider):
 
             sizing = self._node_type_sizing_spec(node_type, node_type_config)
             specs[node_type] = {"catalog_item_name": catalog_item_name.strip(), **sizing}
+            if "ray_packages" in node_type_config:
+                packages = node_type_config["ray_packages"]
+                if not isinstance(packages, str) or not re.fullmatch(
+                    r"\s*[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*(?:\s*,\s*[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)*\s*",
+                    packages,
+                ):
+                    raise ValueError(
+                        f"provider config node_types[{node_type!r}].ray_packages must be a non-empty "
+                        "comma-separated string of Ray extras"
+                    )
+                specs[node_type]["ray_packages"] = ",".join(part.strip() for part in packages.split(","))
 
         unresolved = {
             node_type: spec for node_type, spec in specs.items() if spec["size_flavour_name"] is None
@@ -1176,6 +1244,8 @@ class ResearchCloudNodeProvider(NodeProvider):
                 )
             lookup[key] = node_type
             configs[node_type] = {"catalog_item_name": catalog_item_name, "size_flavour_name": size_flavour_name}
+            if "ray_packages" in spec:
+                configs[node_type]["ray_packages"] = spec["ray_packages"]
         return configs, lookup
 
     @staticmethod

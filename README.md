@@ -91,6 +91,45 @@ can be overridden per node type; the default remains `Ray Head Node` (or
 `Ray Head Node (autoscaling)` with reuse enabled) or `Ray Worker` according to the
 generated type.
 
+### Ray packages
+
+The Ray catalog items' `packages` interactive parameter specifies
+comma-separated Ray extras, as in `ray[client,tune]`. To override it for one
+head or worker type, configure:
+
+```yaml
+head_node_type: head
+available_node_types:
+  head:
+    node_config:
+      ray_packages: "default,client"
+  worker_4_core_16_gb:
+    node_config:
+      ray_packages: "client,tune"
+```
+
+The head defaults to `default,client,train,tune,serve`; it never infers its
+packages from the machine running `ray up`. When the worker setting is omitted,
+the provider infers worker extras from the Ray installation in
+the Python environment running the provider. For autoscaling this is the head
+node's environment, not the environment used to run `ray up`. An extra is
+included when all of its applicable declared dependencies are installed at
+compatible versions, including dependencies of nested extras. Extras with no
+applicable dependencies are not inferred.
+
+Python does not record which extras were requested, so this is an approximation:
+dependencies installed for other reasons can cause an extra to be inferred,
+and partially installed extras are omitted. Platform-specific dependencies
+are checked against the head's platform. Extras do not capture arbitrary
+packages or their exact versions, so use Ray runtime environments or setup
+commands for those. Configure `ray_packages` explicitly when inference does
+not reflect the desired worker installation. If no extras can be inferred,
+worker creation fails with an instruction to configure them: the SRC component
+interprets an empty parameter as its own defaults, not as bare `ray`.
+
+The effective packages are part of paused-workspace reuse compatibility. If
+they change, a head or worker created with different packages is not resumed.
+
 Some GPU flavour names, such as `A10 - 1 GPU`, do not specify a CPU count.
 These node types are generated with their GPU count but no CPU count; the
 provider logs a warning unless you supply one. Set `resources.CPU` to the
