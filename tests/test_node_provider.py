@@ -1518,8 +1518,8 @@ class TestNodeAddresses:
         )
 
         with _patched_from_env(fake_client):
-            assert provider.external_ip("ws-1") == None
-            assert provider.internal_ip("ws-1") == None
+            assert provider.external_ip("ws-1") is None
+            assert provider.internal_ip("ws-1") is None
 
     def test_returns_none_for_a_missing_workspace(self):
         provider = _provider()
