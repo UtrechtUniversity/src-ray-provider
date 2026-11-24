@@ -41,11 +41,10 @@ from src_ray_provider.node_provider import (
     DEFAULT_WORKSPACE_CREATION_TIMEOUT,
     ResearchCloudNodeProvider,
     _infer_worker_ray_packages,
-    _size_flavour_resources,
-    _write_json_object,
-    _workspace_tags_description,
     sanitize_name_component,
 )
+from src_ray_provider.node_tags import _write_json_object, _workspace_tags_description
+from src_ray_provider.node_types import _size_flavour_resources
 
 
 def _provider_config(**overrides) -> dict:
@@ -1535,7 +1534,7 @@ class TestNodeTagCache:
         cache.update("ws-1", {"old": "value"})
         cache.update("ws-2", {"other": "value"})
 
-        with patch("src_ray_provider.node_provider._write_json_object", wraps=_write_json_object) as write:
+        with patch("src_ray_provider.node_tags._write_json_object", wraps=_write_json_object) as write:
             cache.replace("ws-1", new_tags)
 
         assert write.call_count == 1

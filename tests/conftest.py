@@ -11,7 +11,7 @@ def _isolated_cache_dirs(tmp_path, monkeypatch):
 
     ``ResearchCloudNodeProvider`` persists mutable Ray tags (notably
     mutable tags to ``NODE_TAG_CACHE_DIR`` since SRC workspaces have no tag
-    update operation (see ``_NodeTagCache`` in node_provider.py). Without
+    update operation (see ``_NodeTagCache`` in node_tags.py). Without
     this fixture, tests would read/write the real
     ``~/.cache/src_ray_provider/node_tags/`` on the machine running them.
     Bootstrap tests also generate and reuse SSH keypairs.
