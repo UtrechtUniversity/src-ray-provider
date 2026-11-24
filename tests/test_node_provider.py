@@ -1243,7 +1243,7 @@ class TestNonTerminatedNodes:
                 assert provider.non_terminated_nodes({TAG_RAY_NODE_KIND: NODE_KIND_WORKER}) == [], status
                 assert provider.is_terminated("ws-worker"), status
                 assert not provider.is_running("ws-worker"), status
-                assert provider.internal_ip("ws-worker") is None, status
+                assert provider.internal_ip("ws-worker") is "10.0.0.11", status
             assert provider.non_terminated_nodes({}) == ["ws-worker"]
             assert not provider.is_terminated("ws-worker")
             assert not provider.is_running("ws-worker")
