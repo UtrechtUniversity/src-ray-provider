@@ -464,6 +464,8 @@ class ResearchCloudNodeProvider(NodeProvider):
             "python_version": platform.python_version(),
             "packages": ray_packages,
         }
+        if node_type == self.head_node_type:
+            options["optional_parameters"]["autoscale"] = "true"
         if head_address is not None:
             options["optional_parameters"]["head_node_address"] = head_address
         return options

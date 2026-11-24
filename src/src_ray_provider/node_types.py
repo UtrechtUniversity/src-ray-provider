@@ -11,7 +11,7 @@ from researchcloud.utils.flavours import match_size_flavour, parse_size_flavour
 from .utils import deep_merge
 
 
-DEFAULT_HEAD_CATALOG_ITEM_NAME = "[DEV] Ray Head Node"
+DEFAULT_HEAD_CATALOG_ITEM_NAME = "Ray Head Node"
 DEFAULT_WORKER_CATALOG_ITEM_NAME = "Ray Worker"
 DEFAULT_OS_FLAVOUR_NAME = "Ubuntu 24.04"
 
