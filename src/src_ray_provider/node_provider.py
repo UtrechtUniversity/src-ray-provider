@@ -226,7 +226,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         )
         available, default_head = _merge_catalog_node_types(
             generated, node_types, default_head, cluster_config.get("head_node_type"),
-            _head_catalog_item_name(cluster_config["provider"]),
+            DEFAULT_HEAD_CATALOG_ITEM_NAME,
         )
         for name, config in available.items():
             if not isinstance(config, Mapping):
@@ -724,7 +724,7 @@ class ResearchCloudNodeProvider(NodeProvider):
 
     def _default_catalog_item_name(self, node_type: str) -> str:
         if node_type == self.head_node_type:
-            return _head_catalog_item_name(self.provider_config)
+            return DEFAULT_HEAD_CATALOG_ITEM_NAME
         return DEFAULT_WORKER_CATALOG_ITEM_NAME
 
     def _node_type_sizing_spec(self, node_type: str, node_type_config: Mapping[str, Any]) -> dict[str, Any]:

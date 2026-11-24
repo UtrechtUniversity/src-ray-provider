@@ -12,7 +12,6 @@ from .utils import deep_merge
 
 
 DEFAULT_HEAD_CATALOG_ITEM_NAME = "Ray Head Node"
-AUTOSCALING_HEAD_CATALOG_ITEM_NAME = "Ray Head Node (autoscaling)"
 DEFAULT_WORKER_CATALOG_ITEM_NAME = "Ray Worker"
 DEFAULT_OS_FLAVOUR_NAME = "Ubuntu 24.04"
 
@@ -24,11 +23,6 @@ def _resume_enabled(provider_config: Mapping[str, Any]) -> bool:
     if not isinstance(reuse, bool):
         raise ValueError("provider config 'resume_paused_workspaces' must be a boolean")
     return reuse
-
-
-def _head_catalog_item_name(provider_config: Mapping[str, Any]) -> str:
-    return AUTOSCALING_HEAD_CATALOG_ITEM_NAME if _resume_enabled(provider_config) else DEFAULT_HEAD_CATALOG_ITEM_NAME
-
 
 def _size_flavour_resources(name: str) -> dict[str, int] | None:
     """Translate known flavour resources without inventing unknown CPU counts."""
@@ -75,7 +69,7 @@ async def _catalog_node_types(
             raise ValueError(f"ResearchCloud wallet {wallet_name!r} has no products available")
 
         for role, catalog_item_name in (
-            ("head", _head_catalog_item_name(provider_config)),
+            ("head", DEFAULT_HEAD_CATALOG_ITEM_NAME),
             ("worker", DEFAULT_WORKER_CATALOG_ITEM_NAME),
         ):
             catalog_item = await client.resolve_catalog_item(catalog_item_name, co["id"], products)
