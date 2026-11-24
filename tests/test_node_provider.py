@@ -34,7 +34,6 @@ from researchcloud.client import ResearchCloudClient
 from researchcloud.config import DEFAULT_CLOUD_NAME
 from researchcloud.errors import ApiError
 from src_ray_provider.node_provider import (
-    AUTOSCALING_HEAD_CATALOG_ITEM_NAME,
     DEFAULT_HEAD_CATALOG_ITEM_NAME,
     DEFAULT_OS_FLAVOUR_NAME,
     DEFAULT_WORKER_CATALOG_ITEM_NAME,
@@ -404,7 +403,7 @@ class TestBootstrapConfig:
             async def resolve_offering_and_flavours(
                 self, catalog_item, co_id, products, cloud_name, os_flavour_name, size_flavour_name
             ):
-                if catalog_item["name"] in {DEFAULT_HEAD_CATALOG_ITEM_NAME, AUTOSCALING_HEAD_CATALOG_ITEM_NAME}:
+                if catalog_item["name"] == DEFAULT_HEAD_CATALOG_ITEM_NAME:
                     size_flavours = [
                         "2 Core - 8 GB",
                         "GPU 4 Core - 1x A100",
@@ -458,9 +457,9 @@ class TestBootstrapConfig:
         assert any("ray start" in command for command in result["worker_start_ray_commands"])
         assert result["head_start_ray_commands"] == ["true"]
         assert result["available_node_types"]["head"]["node_config"]["catalog_item_name"] == (
-            AUTOSCALING_HEAD_CATALOG_ITEM_NAME
+            DEFAULT_HEAD_CATALOG_ITEM_NAME
         )
-        assert result["provider"]["node_types"]["head"]["catalog_item_name"] == AUTOSCALING_HEAD_CATALOG_ITEM_NAME
+        assert result["provider"]["node_types"]["head"]["catalog_item_name"] == DEFAULT_HEAD_CATALOG_ITEM_NAME
 
     @pytest.mark.parametrize("reuse", [False, True])
     def test_bootstrap_preserves_worker_commands(self, reuse):
@@ -1206,12 +1205,10 @@ def _head_workspace(id: str, status: str = "running", name: str | None = None) -
         flavor_name="2 Core - 8 GB",
     )
 
-
 def _autoscaling_head_workspace(id: str, status: str = "running", name: str | None = None) -> dict:
     workspace = _head_workspace(id, status, name)
-    workspace["meta"]["application_name"] = AUTOSCALING_HEAD_CATALOG_ITEM_NAME
+    workspace["meta"]["application_name"] = DEFAULT_HEAD_CATALOG_ITEM_NAME
     return workspace
-
 
 class TestNonTerminatedNodes:
     def test_returns_only_non_terminal_workspaces_when_no_tag_filters(self):
@@ -2100,14 +2097,6 @@ class TestResumePausedWorkspaces:
     def test_requires_cross_process_locking(self):
         with patch("src_ray_provider.node_provider.fcntl", None), pytest.raises(RuntimeError, match="POSIX"):
             _provider(resume_paused_workspaces=True)
-
-    def test_requires_autoscaling_head_catalog_item(self):
-        config = {
-            "head": {"size_flavour_name": "2 Core - 8 GB", "catalog_item_name": DEFAULT_HEAD_CATALOG_ITEM_NAME},
-            "worker": {"size_flavour_name": "4 Core - 16 GB"},
-        }
-        with pytest.raises(ValueError, match="Ray Head Node \\(autoscaling\\)"):
-            _provider(resume_paused_workspaces=True, node_types=config)
 
     @pytest.mark.parametrize("value", [0, -1, True, float("inf")])
     def test_requires_positive_finite_minimum_ttl(self, value):

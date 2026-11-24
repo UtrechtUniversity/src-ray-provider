@@ -117,12 +117,10 @@ from .node_tags import (
     _workspace_tags_description,
 )
 from .node_types import (
-    AUTOSCALING_HEAD_CATALOG_ITEM_NAME,
     DEFAULT_HEAD_CATALOG_ITEM_NAME as DEFAULT_HEAD_CATALOG_ITEM_NAME,
     DEFAULT_OS_FLAVOUR_NAME,
     DEFAULT_WORKER_CATALOG_ITEM_NAME,
     _catalog_node_types,
-    _head_catalog_item_name,
     _merge_catalog_node_types,
     _provider_node_types,
     _resume_enabled,
@@ -388,12 +386,7 @@ class ResearchCloudNodeProvider(NodeProvider):
             raise ValueError(
                 f"provider config 'head_node_type' {self.head_node_type!r} must be a key in 'node_types'"
             )
-        if self.resume_paused_workspaces and (
-            self._node_type_configs[self.head_node_type]["catalog_item_name"] != AUTOSCALING_HEAD_CATALOG_ITEM_NAME
-        ):
-            raise ValueError(
-                f"reuse requires the head node type to use catalog item {AUTOSCALING_HEAD_CATALOG_ITEM_NAME!r}"
-            )
+
         self._cluster_prefix = f"ray-{sanitize_name_component(cluster_name)}-"
         self._inferred_worker_ray_packages: str | None = None
 
