@@ -71,7 +71,7 @@ EXPECTED_OPTIONAL_PARAMETERS = {
     "python_version": platform.python_version(),
     "packages": "default,client,train,tune,serve",
 }
-EXPECTED_OPTIONAL_PARAMETERS_HEAD = {
+EXPECTED_OPTIONAL_PARAMETERS_AUTOSCALE = {
     **EXPECTED_OPTIONAL_PARAMETERS,
     "autoscale": "true",
 }
@@ -169,7 +169,7 @@ def test_provider_configuration_uses_defaults():
         "size_flavour_name": "2 Core - 8 GB",
         "use_private_network": True,
         "network_name_hint": None,
-        "optional_parameters": EXPECTED_OPTIONAL_PARAMETERS_HEAD,
+        "optional_parameters": EXPECTED_OPTIONAL_PARAMETERS,
     }
     assert provider._workspace_creation_options("worker") == {
         "catalog_item_name": DEFAULT_WORKER_CATALOG_ITEM_NAME,
