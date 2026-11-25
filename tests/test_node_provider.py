@@ -71,10 +71,6 @@ EXPECTED_OPTIONAL_PARAMETERS = {
     "python_version": platform.python_version(),
     "packages": "default,client,train,tune,serve",
 }
-EXPECTED_OPTIONAL_PARAMETERS_AUTOSCALE = {
-    **EXPECTED_OPTIONAL_PARAMETERS,
-    "autoscale": "true",
-}
 
 @pytest.fixture(autouse=True)
 def _stable_inferred_worker_packages(monkeypatch):
@@ -183,15 +179,15 @@ def test_provider_configuration_uses_defaults():
 
 
 @pytest.mark.parametrize(
-    ("reuse", "node_type", "expected"),
+    ("reuse", "node_type"),
     [
-        (False, "controller", "false"),
-        (False, "worker", "false"),
-        (True, "controller", "true"),
-        (True, "worker", "false"),
+        (False, "controller"),
+        (False, "worker"),
+        (True, "controller"),
+        (True, "worker"),
     ],
 )
-def test_systemd_setup_is_enabled_only_for_reusable_head(reuse, node_type, expected):
+def test_systemd_setup_is_disabled_for_all_nodes(reuse, node_type):
     provider = ResearchCloudNodeProvider(
         _provider_config(
             resume_paused_workspaces=reuse,
@@ -204,7 +200,7 @@ def test_systemd_setup_is_enabled_only_for_reusable_head(reuse, node_type, expec
         CLUSTER_NAME,
     )
 
-    assert provider._workspace_creation_options(node_type)["optional_parameters"]["do_setup"] == expected
+    assert provider._workspace_creation_options(node_type)["optional_parameters"]["do_setup"] == "false"
 
 
 def test_provider_configuration_allows_overrides():
@@ -449,16 +445,27 @@ class TestBootstrapConfig:
         assert "ray.worker.default" not in result["available_node_types"]
         assert "_src_node_types_resolved" not in result["provider"]
 
-    def test_ray_bootstrap_configures_systemd_for_reusable_head(self):
+    @pytest.mark.parametrize("reuse", [False, True])
+    def test_ray_bootstrap_starts_head_with_autoscaling_config(self, reuse):
         config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
-        config["provider"]["resume_paused_workspaces"] = True
+        config["provider"]["resume_paused_workspaces"] = reuse
 
         result = _bootstrap_config(config, no_config_cache=True)
 
         assert result["worker_setup_commands"] == []
         assert result["worker_start_ray_commands"] != ["true"]
         assert any("ray start" in command for command in result["worker_start_ray_commands"])
-        assert result["head_start_ray_commands"] == ["true"]
+        assert any(
+            "ray start" in command and "--autoscaling-config=ray_bootstrap_config.yaml" in command
+            for command in result["head_start_ray_commands"]
+        )
+        provider = ResearchCloudNodeProvider(result["provider"], result["cluster_name"])
+        _, config_file = _set_up_config_for_head_node(result, provider, no_restart=False)
+        with config_file:
+            assert "~/ray_bootstrap_config.yaml" in result["file_mounts"]
+            autoscaler_config = json.loads(Path(config_file.name).read_text())
+        assert autoscaler_config["provider"]["type"] == "external"
+        assert autoscaler_config["max_workers"] == config["max_workers"]
         assert result["available_node_types"]["head"]["node_config"]["catalog_item_name"] == (
             DEFAULT_HEAD_CATALOG_ITEM_NAME
         )
@@ -483,10 +490,7 @@ class TestBootstrapConfig:
         ]
         assert result["worker_start_ray_commands"][-1] == "echo worker start"
         assert any("ray start" in command for command in result["worker_start_ray_commands"])
-        if reuse:
-            assert result["head_start_ray_commands"] == ["true"]
-        else:
-            assert result["head_start_ray_commands"][-1] == "echo head start"
+        assert result["head_start_ray_commands"][-1] == "echo head start"
         assert "echo shared setup" in result["head_setup_commands"]
 
     def test_ray_bootstrap_merges_partial_generated_node_type_override(self):
@@ -2484,7 +2488,7 @@ class TestResumePausedWorkspaces:
                 second.result(timeout=10)
         client.workspaces.create.assert_awaited_once()
         parameters = client.workspaces.build_create_payload_from_names.await_args.kwargs["optional_parameters"]
-        assert parameters["do_setup"] == "true"
+        assert parameters["do_setup"] == "false"
         assert "head_node_address" not in parameters
 
     def test_matches_custom_catalogue_item_and_flavour(self):

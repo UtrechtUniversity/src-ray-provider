@@ -179,15 +179,6 @@ An incompatible or near-expiry workspace remains paused and a new one is created
 If `head_workspace_id` is configured, an incompatible paused head causes an error
 rather than creating a different head.
 
-With reuse enabled, new head workspaces request `do_setup=true`: the SRC
-component's systemd service starts Ray and the autoscaler, so the provider
-replaces `head_start_ray_commands` with a no-op.
-Workers request `do_setup=false` and receive the running head's private address
-as `head_node_address`. Ray manages worker setup and startup on new and resumed
-workers; global and per-node-type worker setup commands are preserved. Ray's
-restart options can change which commands run. The worker catalog item must
-support these optional parameters.
-
 On the same machine and account, workspace selection, submission, and pausing
 are serialized. Across machines, avoiding duplicate claims of a paused
 workspace relies on SRC atomically rejecting concurrent resume actions; a

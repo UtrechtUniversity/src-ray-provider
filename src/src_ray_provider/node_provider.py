@@ -253,8 +253,7 @@ class ResearchCloudNodeProvider(NodeProvider):
         cluster_config = deep_merge(defaults, cluster_config)
 
         provider_config = cluster_config.setdefault("provider", {})
-        if _resume_enabled(provider_config):
-            cluster_config["head_start_ray_commands"] = ["true"]
+
         auth_config = cluster_config["auth"]
         if not isinstance(auth_config, dict):
             raise ValueError("cluster config 'auth' must be a mapping")
@@ -458,8 +457,8 @@ class ResearchCloudNodeProvider(NodeProvider):
 
         options["optional_parameters"] = {
             "public_key": self.ray_public_key_data,
-            "do_setup": "true" if self.resume_paused_workspaces and node_type == self.head_node_type else "false",
             "version": ray_version.version,
+            "do_setup": "false",
             "python_version": platform.python_version(),
             "packages": ray_packages,
         }
