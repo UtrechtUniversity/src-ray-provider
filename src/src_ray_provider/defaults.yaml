@@ -1,7 +1,6 @@
 auth:
   ssh_user: ray
 
-#todo: add ulimit
 head_start_ray_commands:
   - source ray_head.env && ray stop
   - >-
@@ -14,7 +13,6 @@ head_start_ray_commands:
     --num-cpus=0
     --autoscaling-config=ray_bootstrap_config.yaml
 
-#todo: add ulimit
 worker_start_ray_commands:
   - source ray_worker.env && ray stop
   - >-

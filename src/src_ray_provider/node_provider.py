@@ -15,9 +15,8 @@ duplication for avoiding any persisted/free-text tag storage:
   This requires each node type to resolve to a distinct pair; this is
   validated at startup. SRC catalog items are role-specific (distinct head
   vs. worker offerings), so the default catalog item name also depends on
-  whether a node type is the configured ``head_node_type``. With workspace
-  reuse enabled, the head uses ``Ray Head Node (autoscaling)`` instead;
-  it can still be overridden per node type via
+  whether a node type is the configured ``head_node_type``. Head node type
+  can be overridden per node type via
   ``available_node_types.<type>.node_config.catalog_item_name``.
 - ``TAG_RAY_NODE_KIND`` is a pure function of the derived node type versus
   ``provider.config.head_node_type`` — a value Ray does not pass to

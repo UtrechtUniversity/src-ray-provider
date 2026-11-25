@@ -9,8 +9,6 @@ Ray autoscaler node provider for SURF ResearchCloud (SRC) (read more [here](http
 ### Prerequisites
 
 - A ResearchCloud CO with the "Ray Head Node" and "Ray Worker" Catalog Items available.
-- For paused-workspace reuse, the "Ray Head Node (autoscaling)" Catalog Item must
-  also be available.
 - In this CO, create a CO secret called `RAY_SRC_TOKEN` and fill it with an SRC API key.
 
 **Security note**: to use Ray on SRC, you currently need to save an API key in a secret `RAY_SCR_TOKEN` inside your Collaboration. At the moment, ResearchCloud API keys cannot yet be scoped to a specific CO (coming soon), so it is best to test this package in a Collaboration to which only you have access.
@@ -52,8 +50,7 @@ provider:
 The `provider` block also requires `co_name` and `wallet_name`. Ray's
 `head_node_type` and `available_node_types` are generated from the size
 flavours available for the `Ray Head Node` and `Ray Worker` catalog items on
-the configured cloud. With paused-workspace reuse enabled, head flavours are
-instead discovered from `Ray Head Node (autoscaling)`. Only CPU-only head
+the configured cloud. Only CPU-only head
 flavours are generated; the flavour with the smallest known CPU count becomes
 `head` and is selected by default. If no usable CPU-only head flavour is
 available, discovery fails. Worker flavours may include GPUs, and each
@@ -87,8 +84,7 @@ To customize the default `head` through `available_node_types.head`, also set
 `head_node_type: head` so Ray applies head-specific defaults before discovery.
 Other generated node type names use a lowercase `head_` or `worker_` prefix
 followed by the normalized size-flavour name. `node_config.catalog_item_name`
-can be overridden per node type; the default remains `Ray Head Node` (or
-`Ray Head Node (autoscaling)` with reuse enabled) or `Ray Worker` according to the
+can be overridden per node type; the default remains `Ray Head Node` or `Ray Worker` according to the
 generated type.
 
 ### Ray packages
@@ -185,8 +181,7 @@ rather than creating a different head.
 
 With reuse enabled, new head workspaces request `do_setup=true`: the SRC
 component's systemd service starts Ray and the autoscaler, so the provider
-replaces `head_start_ray_commands` with a no-op. The selected head type must
-use `Ray Head Node (autoscaling)` and support this systemd setup.
+replaces `head_start_ray_commands` with a no-op.
 Workers request `do_setup=false` and receive the running head's private address
 as `head_node_address`. Ray manages worker setup and startup on new and resumed
 workers; global and per-node-type worker setup commands are preserved. Ray's
