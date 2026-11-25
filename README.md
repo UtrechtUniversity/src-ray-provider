@@ -55,10 +55,6 @@ flavours are generated; the flavour with the smallest known CPU count becomes
 `head` and is selected by default. If no usable CPU-only head flavour is
 available, discovery fails. Worker flavours may include GPUs, and each
 generated worker node type uses the top-level `max_workers` limit.
-Generated head types advertise zero CPUs by default, so Ray does not schedule
-CPU tasks on the head. This matches the default `ray start --head --num-cpus=0`
-command. To run tasks on the head, explicitly set its `resources.CPU` to the
-desired number; Ray passes that resource override to the head at startup.
 This catalog lookup happens before Ray validates the configuration during
 `ray up`, so `RESEARCH_CLOUD_TOKEN` must be available when bootstrapping the
 cluster. If Ray has cached an earlier configuration, use

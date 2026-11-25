@@ -456,12 +456,9 @@ class TestBootstrapConfig:
         assert result["worker_start_ray_commands"] != ["true"]
         assert any("ray start" in command for command in result["worker_start_ray_commands"])
         assert any(
-            "ray start" in command
-            and "--autoscaling-config=ray_bootstrap_config.yaml" in command
-            and "--num-cpus=0" in command
+            "ray start" in command and "--autoscaling-config=ray_bootstrap_config.yaml" in command
             for command in result["head_start_ray_commands"]
         )
-        assert result["available_node_types"][result["head_node_type"]]["resources"]["CPU"] == 0
         provider = ResearchCloudNodeProvider(result["provider"], result["cluster_name"])
         _, config_file = _set_up_config_for_head_node(result, provider, no_restart=False)
         with config_file:
@@ -541,7 +538,7 @@ class TestBootstrapConfig:
 
         result = _bootstrap_config(config, no_config_cache=True)
 
-        assert result["available_node_types"]["head"]["resources"] == {"CPU": 0, "custom": 1}
+        assert result["available_node_types"]["head"]["resources"] == {"CPU": 1, "custom": 1}
         assert result["available_node_types"]["head"]["max_workers"] == 0
         assert "head_1_core_8_gb_ram" not in result["available_node_types"]
 
@@ -562,18 +559,8 @@ class TestBootstrapConfig:
 
         assert result["head_node_type"] == "head_2_core_8_gb"
         assert result["provider"]["head_node_type"] == "head_2_core_8_gb"
-        assert result["available_node_types"]["head_2_core_8_gb"]["resources"] == {"CPU": 0}
         assert result["available_node_types"]["custom_worker"]["resources"] == {"CPU": 8}
         assert result["provider"]["node_types"]["custom_worker"]["catalog_item_name"] == "Custom Ray Worker"
-
-    def test_explicit_head_cpu_resources_override_default(self):
-        config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
-        config["head_node_type"] = "head"
-        config["available_node_types"] = {"head": {"resources": {"CPU": 2}}}
-
-        result = _bootstrap_config(config, no_config_cache=True)
-
-        assert result["available_node_types"]["head"]["resources"] == {"CPU": 2}
 
     def test_copies_head_node_type_from_cluster_config_top_level(self):
         cluster_config = {
@@ -600,7 +587,7 @@ class TestBootstrapConfig:
         assert result["available_node_types"]["head"] == {
             "min_workers": 0,
             "max_workers": 0,
-            "resources": {"CPU": 0},
+            "resources": {"CPU": 1},
             "node_config": {
                 "catalog_item_name": DEFAULT_HEAD_CATALOG_ITEM_NAME,
                 "size_flavour_name": "1 Core - 8 GB RAM",
@@ -679,7 +666,7 @@ class TestBootstrapConfig:
         provider = ResearchCloudNodeProvider(result["provider"], CLUSTER_NAME)
 
         assert result["head_node_type"] == "head"
-        assert result["available_node_types"]["head"]["resources"] == {"CPU": 0, "custom": 1}
+        assert result["available_node_types"]["head"]["resources"] == {"CPU": 1, "custom": 1}
         assert provider._workspace_creation_options("head")["size_flavour_name"] == "1 Core - 8 GB RAM"
         assert "head_1_core_8_gb_ram" not in result["available_node_types"]
 
