@@ -45,7 +45,7 @@ rsync_filter: []
 # provider creates Ray node types for CPU-only head and CPU/GPU worker size
 # flavours before Ray validates the configuration. The smallest-CPU head
 # flavour is selected by default; define head_node_type / available_node_types
-# below to override.
+# below to override. Generated head types advertise zero CPUs to Ray by default.
 max_workers: 4
 
 # Override Ray extras per node type. Workers otherwise infer extras from the
