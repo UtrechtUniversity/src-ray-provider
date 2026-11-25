@@ -263,6 +263,8 @@ workspace does not reach `running` within this limit. Launch tags are cached
 as soon as SRC returns the workspace ID, before the wait. Discovery and
 workspace submission are coordinated on the same machine/account so Ray
 does not see a newly submitted workspace before its launch tags are saved.
+The provider returns node IP addresses only when the cached workspace status is
+`running`; calls to `non_terminated_nodes` refresh the workspace cache.
 The cache and coordination are local: Ray commands on different machines or
 accounts do not share the tags.
 
