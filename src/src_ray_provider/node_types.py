@@ -110,7 +110,7 @@ async def _catalog_node_types(
                 generated[node_type] = {
                     "min_workers": 0,
                     "max_workers": 0 if role == "head" else max_workers,
-                    "resources": resources,
+                    "resources": {"CPU": 0} if role == "head" else resources,
                     "node_config": {
                         "catalog_item_name": catalog_item_name,
                         "size_flavour_name": flavour_name,
