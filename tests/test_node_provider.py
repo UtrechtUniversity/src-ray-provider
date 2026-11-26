@@ -39,7 +39,6 @@ from src_ray_provider.node_provider import (
     DEFAULT_WORKER_CATALOG_ITEM_NAME,
     DEFAULT_WORKSPACE_CREATION_TIMEOUT,
     ResearchCloudNodeProvider,
-    _infer_worker_ray_packages,
     sanitize_name_component,
 )
 from src_ray_provider.node_tags import _write_json_object, _workspace_tags_description
@@ -69,86 +68,8 @@ EXPECTED_OPTIONAL_PARAMETERS = {
     "do_setup": "false",
     "version": ray_version.version,
     "python_version": platform.python_version(),
-    "packages": "default,client,train,tune,serve",
+    "packages": "",
 }
-
-@pytest.fixture(autouse=True)
-def _stable_inferred_worker_packages(monkeypatch):
-    monkeypatch.setattr(
-        "src_ray_provider.node_provider._infer_worker_ray_packages",
-        lambda: EXPECTED_OPTIONAL_PARAMETERS["packages"],
-    )
-
-
-def test_infers_extras_from_applicable_installed_requirements(monkeypatch):
-    from importlib.metadata import PackageNotFoundError
-
-    def dist(version, requires=(), extras=()):
-        return SimpleNamespace(
-            version=version,
-            requires=requires,
-            metadata=SimpleNamespace(get_all=lambda key, default: list(extras) if key == "Provides-Extra" else default),
-        )
-
-    distributions = {
-        "ray": dist("2.0", [
-            'core>=1',
-            'common; extra == "client"',
-            'nested[standard]>=2; extra == "serve"',
-            'old>=3; extra == "train"',
-            'missing; extra == "tune"',
-            'missing; sys_platform == "never" and extra == "client"',
-            'missing; sys_platform == "never" and extra == "platform-only"',
-        ], ["tune", "serve", "train", "client", "platform-only", "empty"]),
-        "common": dist("1"),
-        "nested": dist("2", ['nested-dep>=1; extra == "standard"']),
-        "nested-dep": dist("1"),
-        "old": dist("2"),
-    }
-
-    def fake_distribution(name):
-        if name not in distributions:
-            raise PackageNotFoundError(name)
-        return distributions[name]
-
-    monkeypatch.setattr("src_ray_provider.node_provider.distribution", fake_distribution)
-    assert _infer_worker_ray_packages() == "client,serve"
-    del distributions["nested-dep"]
-    assert _infer_worker_ray_packages() == "client"
-
-
-def test_cannot_infer_empty_ray_extras(monkeypatch):
-    monkeypatch.setattr(
-        "src_ray_provider.node_provider.distribution",
-        lambda name: SimpleNamespace(requires=[], metadata=SimpleNamespace(get_all=lambda key, default: ["client"])),
-    )
-    with pytest.raises(ValueError, match="set node_config.ray_packages explicitly"):
-        _infer_worker_ray_packages()
-
-
-def test_worker_inference_is_lazy_cached_and_skipped_for_overrides(monkeypatch):
-    calls = []
-
-    def infer():
-        calls.append(True)
-        return "client"
-
-    monkeypatch.setattr("src_ray_provider.node_provider._infer_worker_ray_packages", infer)
-    provider = ResearchCloudNodeProvider(
-        _provider_config(node_types={
-            "head": {"size_flavour_name": "2 Core - 8 GB"},
-            "worker": {"size_flavour_name": "4 Core - 16 GB"},
-            "other": {"size_flavour_name": "8 Core - 32 GB", "ray_packages": "tune"},
-        }), CLUSTER_NAME,
-    )
-    assert provider._workspace_creation_options("head")["optional_parameters"]["packages"] == (
-        EXPECTED_OPTIONAL_PARAMETERS["packages"]
-    )
-    assert provider._workspace_creation_options("other")["optional_parameters"]["packages"] == "tune"
-    assert not calls
-    assert provider._workspace_creation_options("worker")["optional_parameters"]["packages"] == "client"
-    assert provider._workspace_creation_options("worker")["optional_parameters"]["packages"] == "client"
-    assert len(calls) == 1
 
 
 def test_provider_configuration_uses_defaults():
@@ -228,26 +149,26 @@ def test_provider_configuration_allows_overrides():
     }
 
 
-def test_worker_ray_packages_override_is_per_node_type_and_affects_reuse():
+@pytest.mark.parametrize("node_type", ["head", "worker"])
+def test_ray_packages_override_is_per_node_type_and_affects_reuse(node_type):
+    node_types = {
+        "head": {"size_flavour_name": "2 Core - 8 GB"},
+        "worker": {"size_flavour_name": "4 Core - 16 GB"},
+        "other": {"size_flavour_name": "8 Core - 32 GB"},
+    }
+    node_types[node_type]["ray_packages"] = " client, tune "
     provider = ResearchCloudNodeProvider(
-        _provider_config(node_types={
-            "head": {"size_flavour_name": "2 Core - 8 GB"},
-            "worker": {"size_flavour_name": "4 Core - 16 GB", "ray_packages": " client, tune "},
-            "other": {"size_flavour_name": "8 Core - 32 GB"},
-        }),
+        _provider_config(node_types=node_types),
         CLUSTER_NAME,
     )
     default_provider = ResearchCloudNodeProvider(_provider_config(), CLUSTER_NAME)
 
-    assert provider._workspace_creation_options("head")["optional_parameters"]["packages"] == (
-        EXPECTED_OPTIONAL_PARAMETERS["packages"]
-    )
-    assert provider._workspace_creation_options("worker")["optional_parameters"]["packages"] == "client,tune"
-    assert provider._workspace_creation_options("other")["optional_parameters"]["packages"] == (
-        EXPECTED_OPTIONAL_PARAMETERS["packages"]
-    )
-    assert provider._reuse_configuration("worker", None) != default_provider._reuse_configuration("worker", None)
-    assert provider._reuse_configuration("head", None) == default_provider._reuse_configuration("head", None)
+    other_type = "worker" if node_type == "head" else "head"
+    assert provider._workspace_creation_options(node_type)["optional_parameters"]["packages"] == "client,tune"
+    assert provider._workspace_creation_options(other_type)["optional_parameters"]["packages"] == ""
+    assert provider._workspace_creation_options("other")["optional_parameters"]["packages"] == ""
+    assert provider._reuse_configuration(node_type, None) != default_provider._reuse_configuration(node_type, None)
+    assert provider._reuse_configuration(other_type, None) == default_provider._reuse_configuration(other_type, None)
 
 
 @pytest.mark.parametrize("node_type", ["head", "worker"])
@@ -260,26 +181,6 @@ def test_ray_packages_requires_comma_separated_extra_names(node_type, packages):
     node_types[node_type]["ray_packages"] = packages
     with pytest.raises(ValueError, match="ray_packages"):
         ResearchCloudNodeProvider(_provider_config(node_types=node_types), CLUSTER_NAME)
-
-
-def test_head_ray_packages_override_is_independent_and_affects_reuse(monkeypatch):
-    def fail_inference():
-        raise AssertionError("head creation must not infer worker packages")
-
-    monkeypatch.setattr("src_ray_provider.node_provider._infer_worker_ray_packages", fail_inference)
-    provider = ResearchCloudNodeProvider(
-        _provider_config(node_types={
-            "head": {"size_flavour_name": "2 Core - 8 GB", "ray_packages": " client, tune "},
-            "worker": {"size_flavour_name": "4 Core - 16 GB", "ray_packages": "serve"},
-        }), CLUSTER_NAME,
-    )
-    default_provider = ResearchCloudNodeProvider(_provider_config(), CLUSTER_NAME)
-    assert provider._workspace_creation_options("head")["optional_parameters"]["packages"] == "client,tune"
-    assert provider._workspace_creation_options("worker")["optional_parameters"]["packages"] == "serve"
-    assert provider._reuse_configuration("head", None) != default_provider._reuse_configuration("head", None)
-    assert default_provider._workspace_creation_options("head")["optional_parameters"]["packages"] == (
-        EXPECTED_OPTIONAL_PARAMETERS["packages"]
-    )
 
 
 @pytest.mark.parametrize("value", ["", "  ", 42, False])
@@ -1851,16 +1752,16 @@ class TestCreateNode:
             "optional_parameters"
         ] == EXPECTED_OPTIONAL_PARAMETERS
 
-    @pytest.mark.parametrize(("override", "expected"), [(None, "client"), ("serve,tune", "serve,tune")])
-    def test_worker_packages_reach_workspace_payload(self, monkeypatch, override, expected):
-        monkeypatch.setattr("src_ray_provider.node_provider._infer_worker_ray_packages", lambda: "client")
-        worker_config = {"size_flavour_name": "4 Core - 16 GB"}
-        if override is not None:
-            worker_config["ray_packages"] = override
-        provider = _provider(node_types={
+    @pytest.mark.parametrize(("node_type", "node_kind"), [("head", NODE_KIND_HEAD), ("worker", NODE_KIND_WORKER)])
+    @pytest.mark.parametrize(("override", "expected"), [(None, ""), ("serve,tune", "serve,tune")])
+    def test_packages_reach_workspace_payload(self, node_type, node_kind, override, expected):
+        node_types = {
             "head": {"size_flavour_name": "2 Core - 8 GB"},
-            "worker": worker_config,
-        })
+            "worker": {"size_flavour_name": "4 Core - 16 GB"},
+        }
+        if override is not None:
+            node_types[node_type]["ray_packages"] = override
+        provider = _provider(node_types=node_types)
         client = _FakeClient(co={"id": "co-1"}, workspaces=[])
         client.workspaces.build_create_payload_from_names.side_effect = (
             lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
@@ -1868,33 +1769,11 @@ class TestCreateNode:
         client.workspaces.create.return_value = {"id": "ws-1", "name": "node-1", "status": "running"}
 
         with _patched_from_env(client):
-            provider.create_node({}, {TAG_RAY_USER_NODE_TYPE: "worker", TAG_RAY_NODE_KIND: NODE_KIND_WORKER}, 1)
+            provider.create_node({}, {TAG_RAY_USER_NODE_TYPE: node_type, TAG_RAY_NODE_KIND: node_kind}, 1)
 
         assert client.workspaces.build_create_payload_from_names.await_args.kwargs["optional_parameters"][
             "packages"
         ] == expected
-
-    def test_head_package_override_reaches_workspace_payload(self, monkeypatch):
-        def fail_inference():
-            raise AssertionError("head creation must not infer worker packages")
-
-        monkeypatch.setattr("src_ray_provider.node_provider._infer_worker_ray_packages", fail_inference)
-        provider = _provider(node_types={
-            "head": {"size_flavour_name": "2 Core - 8 GB", "ray_packages": "client,tune"},
-            "worker": {"size_flavour_name": "4 Core - 16 GB"},
-        })
-        client = _FakeClient(co={"id": "co-1"}, workspaces=[])
-        client.workspaces.build_create_payload_from_names.side_effect = (
-            lambda **kwargs: SimpleNamespace(payload={"name": kwargs["workspace_name"]})
-        )
-        client.workspaces.create.return_value = {"id": "ws-1", "name": "node-1", "status": "running"}
-
-        with _patched_from_env(client):
-            provider.create_node({}, {TAG_RAY_USER_NODE_TYPE: "head", TAG_RAY_NODE_KIND: NODE_KIND_HEAD}, 1)
-
-        assert client.workspaces.build_create_payload_from_names.await_args.kwargs["optional_parameters"][
-            "packages"
-        ] == "client,tune"
 
     def test_creates_head_node_without_a_cluster_name_tag(self):
         """Neither ``ray.autoscaler._private.commands.get_or_create_head_node``

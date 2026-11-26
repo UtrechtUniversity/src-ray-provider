@@ -10,7 +10,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "ray>=2.9,<3",
-  "packaging",
   "cryptography",
   "researchcloud-api @ git+https://github.com/UtrechtUniversity/src-api-sdk.git",
 ]

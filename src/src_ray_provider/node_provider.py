@@ -81,14 +81,11 @@ import threading
 import uuid
 import yaml
 from datetime import datetime, timedelta, timezone
-from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from packaging.requirements import Requirement
-
 from ray import _version as ray_version
 from ray.autoscaler.node_provider import NodeProvider
 from ray.autoscaler.tags import (
@@ -138,52 +135,6 @@ logger = logging.getLogger(__name__)
 
 NODE_TAG_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "node_tags"
 SSH_KEY_CACHE_DIR = Path.home() / ".cache" / "src_ray_provider" / "ssh_keys"
-
-
-def _infer_worker_ray_packages() -> str:
-    """Infer Ray extras from installed, applicable dependency metadata."""
-    ray_dist = distribution("ray")
-    ray_requirements = [Requirement(item) for item in ray_dist.requires or []]
-
-    def installed(requirement: Requirement, seen: set[tuple[str, tuple[str, ...]]]) -> bool:
-        try:
-            dist = distribution(requirement.name)
-        except PackageNotFoundError:
-            return False
-        if requirement.specifier and not requirement.specifier.contains(dist.version, prereleases=True):
-            return False
-        if not requirement.extras:
-            return True
-
-        key = (requirement.name.lower(), tuple(sorted(requirement.extras)))
-        if key in seen:
-            return True
-        seen = seen | {key}
-        for item in dist.requires or []:
-            dependency = Requirement(item)
-            if dependency.marker is None or any(
-                dependency.marker.evaluate({"extra": extra}) for extra in ("", *requirement.extras)
-            ):
-                if not installed(dependency, seen):
-                    return False
-        return True
-
-    inferred = []
-    for extra in sorted(ray_dist.metadata.get_all("Provides-Extra", [])):
-        requirements = [
-            requirement for requirement in ray_requirements
-            if requirement.marker is not None
-            and requirement.marker.evaluate({"extra": extra})
-            and not requirement.marker.evaluate({"extra": ""})
-        ]
-        if requirements and all(installed(requirement, set()) for requirement in requirements):
-            inferred.append(extra)
-    if not inferred:
-        raise ValueError(
-            "Could not infer any installed Ray extras for workers. The SRC Ray component uses its own "
-            "defaults for an empty packages parameter; set node_config.ray_packages explicitly."
-        )
-    return ",".join(inferred)
 
 
 class ResearchCloudNodeProvider(NodeProvider):
@@ -386,7 +337,6 @@ class ResearchCloudNodeProvider(NodeProvider):
             )
 
         self._cluster_prefix = f"ray-{sanitize_name_component(cluster_name)}-"
-        self._inferred_worker_ray_packages: str | None = None
 
         self._workspaces: dict[str, dict[str, Any]] = {}
         self._workspaces_lock = threading.RLock()
@@ -438,14 +388,8 @@ class ResearchCloudNodeProvider(NodeProvider):
 
     def _workspace_creation_options(self, node_type: str, head_address: str | None = None) -> dict[str, Any]:
         node_type_config = self._node_type_configs[node_type]
-        if "ray_packages" in node_type_config:
-            ray_packages = node_type_config["ray_packages"]
-        elif node_type == self.head_node_type:
-            ray_packages = "default,client,train,tune,serve"
-        else:
-            if self._inferred_worker_ray_packages is None:
-                self._inferred_worker_ray_packages = _infer_worker_ray_packages()
-            ray_packages = self._inferred_worker_ray_packages
+        ray_packages = node_type_config.get("ray_packages", "")
+
         options = {
             "catalog_item_name": node_type_config["catalog_item_name"],
             "cloud_name": self.cloud_name,

@@ -108,27 +108,15 @@ available_node_types:
       ray_packages: "client,tune"
 ```
 
-The head defaults to `default,client,train,tune,serve`; it never infers its
-packages from the machine running `ray up`. When the worker setting is omitted,
-the provider infers worker extras from the Ray installation in
-the Python environment running the provider. For autoscaling this is the head
-node's environment, not the environment used to run `ray up`. An extra is
-included when all of its applicable declared dependencies are installed at
-compatible versions, including dependencies of nested extras. Extras with no
-applicable dependencies are not inferred.
+When `ray_packages` is omitted for either a head or worker type, the provider
+passes an empty `packages` parameter, allowing that catalog item to use its own
+default. The provider does not infer packages from the head node's environment.
+Use Ray runtime environments or setup commands for other packages or exact
+versions.
 
-Python does not record which extras were requested, so this is an approximation:
-dependencies installed for other reasons can cause an extra to be inferred,
-and partially installed extras are omitted. Platform-specific dependencies
-are checked against the head's platform. Extras do not capture arbitrary
-packages or their exact versions, so use Ray runtime environments or setup
-commands for those. Configure `ray_packages` explicitly when inference does
-not reflect the desired worker installation. If no extras can be inferred,
-worker creation fails with an instruction to configure them: the SRC component
-interprets an empty parameter as its own defaults, not as bare `ray`.
-
-The effective packages are part of paused-workspace reuse compatibility. If
-they change, a head or worker created with different packages is not resumed.
+The passed `packages` parameter is part of paused-workspace reuse compatibility.
+Changing it prevents reuse of a workspace created with a different value.
+Changes to a catalog item's default are not detected when the parameter is empty.
 
 Some GPU flavour names, such as `A10 - 1 GPU`, do not specify a CPU count.
 These node types are generated with their GPU count but no CPU count; the
