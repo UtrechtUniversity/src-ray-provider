@@ -918,6 +918,61 @@ class TestBootstrapConfig:
         result = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
 
         assert result["provider"]["ray_public_key_data"] == PUBLIC_KEY
+        assert "ssh_public_key" not in result["auth"]
+
+    @pytest.mark.parametrize("private_key", [None, "", "   "])
+    @pytest.mark.parametrize("public_key", [None, "id_ed25519.pub"])
+    def test_rejects_embedded_public_key_without_private_key(self, private_key, public_key):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "auth": {"ssh_private_key": private_key, "ssh_public_key": public_key},
+            "provider": {"ray_public_key_data": PUBLIC_KEY},
+        }
+
+        with pytest.raises(ValueError, match="ssh_private_key.*provider.ray_public_key_data"):
+            ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+
+    def test_rebootstraps_embedded_public_key_without_public_key_file(self, tmp_path, monkeypatch):
+        cluster_config = {
+            "cluster_name": CLUSTER_NAME,
+            "available_node_types": {},
+            "provider": {
+                "co_name": "Example CO",
+                "wallet_name": "Example Wallet",
+                "ray_public_key_data": PUBLIC_KEY,
+            },
+            "auth": {"ssh_user": "ray", "ssh_private_key": str(tmp_path / "id_ed25519")},
+        }
+
+        def unexpected_key_generation(cluster_name):
+            pytest.fail("A config with embedded public-key data must not generate a keypair")
+
+        monkeypatch.setattr(ResearchCloudNodeProvider, "_ensure_generated_keypair", unexpected_key_generation)
+        first = ResearchCloudNodeProvider.bootstrap_config(cluster_config)
+        second = ResearchCloudNodeProvider.bootstrap_config(first)
+
+        for result in (first, second):
+            assert result["provider"]["ray_public_key_data"] == PUBLIC_KEY
+            assert result["auth"]["ssh_private_key"] == str(tmp_path / "id_ed25519")
+            assert "ssh_public_key" not in result["auth"]
+            provider = ResearchCloudNodeProvider(result["provider"], CLUSTER_NAME)
+            assert provider._workspace_creation_options(provider.head_node_type)["optional_parameters"]["public_key"] == (
+                PUBLIC_KEY
+            )
+
+    def test_rebootstraps_ray_head_autoscaler_config(self):
+        config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())
+        bootstrapped = _bootstrap_config(config, no_config_cache=True)
+        provider = ResearchCloudNodeProvider(bootstrapped["provider"], bootstrapped["cluster_name"])
+        _, config_file = _set_up_config_for_head_node(bootstrapped, provider, no_restart=False)
+        with config_file:
+            head_config = json.loads(Path(config_file.name).read_text())
+
+        result = _bootstrap_config(head_config, no_config_cache=True)
+
+        assert result["provider"]["ray_public_key_data"] == bootstrapped["provider"]["ray_public_key_data"]
+        assert result["auth"]["ssh_private_key"] == "~/ray_bootstrap_key.pem"
+        assert "ssh_public_key" not in result["auth"]
 
     def test_generates_and_reuses_a_keypair_when_auth_has_no_keys(self, tmp_path, monkeypatch):
         """Without any auth.ssh_public_key/ssh_private_key, nothing in Ray

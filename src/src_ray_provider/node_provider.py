@@ -54,10 +54,11 @@ Ray tags remain in a local JSON file under
 ``~/.cache/src_ray_provider/node_tags/<cluster_name>.json`` (see
 ``_NodeTagCache``), because the workspace API has no tag update operation.
 
-SSH access for both the head and worker nodes relies on ``auth.ssh_public_key``
-/``auth.ssh_private_key`` in cluster.yaml, which ``bootstrap_config`` requires
-to be set together (or left unset together) -- see its docstring for why only
-setting one silently breaks head-to-worker SSH. When both are left unset,
+SSH access for both the head and worker nodes normally relies on
+``auth.ssh_public_key`` and ``auth.ssh_private_key`` in cluster.yaml, which
+``bootstrap_config`` requires to be set together (or left unset together).
+An already bootstrapped config can instead contain ``provider.ray_public_key_data``
+and ``auth.ssh_private_key``. When all key settings are left unset,
 nothing in Ray generates credentials for the ``external`` provider type on
 its own (unlike its AWS/vSphere providers), so ``bootstrap_config`` generates
 and caches its own ed25519 keypair per cluster name instead (see
@@ -214,41 +215,47 @@ class ResearchCloudNodeProvider(NodeProvider):
         has_public_key = isinstance(public_key, str) and bool(public_key.strip())
         has_private_key = isinstance(private_key, str) and bool(private_key.strip())
 
-        if has_public_key != has_private_key:
-            # Ray only copies auth.ssh_private_key onto the head node (as
-            # ~/ray_bootstrap_key.pem, see ray.autoscaler._private.commands
-            # ._set_up_config_for_head_node) when it is explicit, and this
-            # provider can only turn a public key into the SRC catalog
-            # item's public_key parameter (below) if one is given.
-            # Without both, the head's autoscaler monitor has no private key
-            # to SSH into newly created workers with -- so workers get
-            # created successfully but every SSH attempt into them fails
-            # with "permission denied". Fail fast here instead of letting
-            # that surface confusingly later during autoscaling.
+        if not provider_config.get("ray_public_key_data"):
+            if has_private_key != has_public_key:
+                # Ray only copies auth.ssh_private_key onto the head node (as
+                # ~/ray_bootstrap_key.pem, see ray.autoscaler._private.commands
+                # ._set_up_config_for_head_node) when it is explicit, and this
+                # provider can only turn a public key into the SRC catalog
+                # item's public_key parameter (below) if one is given.
+                # Without both, the head's autoscaler monitor has no private key
+                # to SSH into newly created workers with -- so workers get
+                # created successfully but every SSH attempt into them fails
+                # with "permission denied". Fail fast here instead of letting
+                # that surface confusingly later during autoscaling.
+                raise ValueError(
+                    "cluster config 'auth.ssh_public_key' and 'auth.ssh_private_key' must "
+                    "both be set, or both be left unset (in which case this provider "
+                    "generates and reuses its own keypair)"
+                )
+
+            if not has_public_key and not has_private_key:
+                # Nothing in Ray generates SSH credentials for the "external"
+                # provider type on its own (unlike e.g. the AWS or vSphere
+                # providers' bootstrap_config, which create a keypair when
+                # auth.ssh_private_key is absent). Without one, SRC workspaces
+                # get created with no authorized key at all and nothing can SSH
+                # into them. Generate (or reuse, across repeated `ray up` runs)
+                # a keypair dedicated to this cluster name instead.
+                generated_private_key, generated_public_key = ResearchCloudNodeProvider._ensure_generated_keypair(
+                    cluster_config.get("cluster_name")
+                )
+                auth_config["ssh_private_key"] = str(generated_private_key)
+                auth_config["ssh_public_key"] = str(generated_public_key)
+        elif not has_private_key:
             raise ValueError(
-                "cluster config 'auth.ssh_public_key' and 'auth.ssh_private_key' must "
-                "both be set, or both be left unset (in which case this provider "
-                "generates and reuses its own keypair)"
+                "'auth.ssh_private_key' must point at the private key file corresponding to "
+                "'provider.ray_public_key_data'"
             )
 
-        if not has_public_key and not has_private_key:
-            # Nothing in Ray generates SSH credentials for the "external"
-            # provider type on its own (unlike e.g. the AWS or vSphere
-            # providers' bootstrap_config, which create a keypair when
-            # auth.ssh_private_key is absent). Without one, SRC workspaces
-            # get created with no authorized key at all and nothing can SSH
-            # into them. Generate (or reuse, across repeated `ray up` runs)
-            # a keypair dedicated to this cluster name instead.
-            generated_private_key, generated_public_key = ResearchCloudNodeProvider._ensure_generated_keypair(
-                cluster_config.get("cluster_name")
+        if has_public_key or not provider_config.get("ray_public_key_data"):
+            provider_config["ray_public_key_data"] = (
+                Path(auth_config.pop("ssh_public_key")).read_text(encoding="utf-8").strip()
             )
-            auth_config["ssh_private_key"] = str(generated_private_key)
-            auth_config["ssh_public_key"] = str(generated_public_key)
-
-        provider_config["ray_public_key_data"] = (
-            Path(auth_config["ssh_public_key"]).read_text(encoding="utf-8").strip()
-        )
-        auth_config.pop("ssh_public_key")
 
         if not provider_config.pop("_src_node_types_resolved", False):
             cluster_config = ResearchCloudNodeProvider.fillout_available_node_types_resources(cluster_config)

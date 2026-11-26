@@ -224,7 +224,10 @@ private key and its matching public key, or leave both unset to generate and
 reuse a dedicated keypair for the cluster. Ray copies the private key to the
 head node, so avoid using your normal private key. The provider reads the
 public-key file during bootstrap and passes its contents to the SRC catalog
-item.
+item. A bootstrapped config contains this data in `provider.ray_public_key_data`
+and no longer needs `auth.ssh_public_key`, but still requires the matching
+`auth.ssh_private_key`. If both a public-key file and embedded public-key data
+are supplied, the file takes precedence.
 
 Before starting Ray on a worker, the default start commands wait for
 `ray_worker.env` to exist. If provisioning never creates the file, the worker
