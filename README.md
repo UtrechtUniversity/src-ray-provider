@@ -230,8 +230,10 @@ and no longer needs `auth.ssh_public_key`, but still requires the matching
 are supplied, the file takes precedence.
 
 Before starting Ray on a worker, the default start commands wait for
-`ray_worker.env` to exist. If provisioning never creates the file, the worker
-start remains waiting until interrupted.
+`ray_worker.env` to exist. The worker provisioning script must create this file
+only after Ray is installed and available on the `ray` user's PATH; the file
+acts as the readiness signal. If provisioning never creates the file, the
+worker start remains waiting until interrupted.
 
 The provider polls an SRC workspace until it reaches `running` before returning
 the node to Ray. When reuse is enabled it also waits for `paused` on termination.
