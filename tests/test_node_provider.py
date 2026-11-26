@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import select
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
@@ -396,6 +398,57 @@ class TestBootstrapConfig:
         assert any("ray start" in command for command in result["worker_start_ray_commands"])
         assert result["head_start_ray_commands"][-1] == "echo head start"
         assert "echo shared setup" in result["head_setup_commands"]
+
+    def test_worker_start_waits_for_provisioned_environment(self, tmp_path):
+        config = yaml.safe_load((Path(__file__).parent.parent / "cluster.yaml").read_text())
+        commands = _bootstrap_config(config, no_config_cache=True)["worker_start_ray_commands"]
+        wait_command, stop_command, start_command = commands
+        shell_functions = 'sleep() { echo waiting; read -r ignored; }; ray() { printf "ray %s\\n" "$*"; }; '
+
+        process = subprocess.Popen(
+            ["bash", "-c", shell_functions + wait_command],
+            cwd=tmp_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert select.select([process.stdout], [], [], 5)[0], "worker did not wait for the environment"
+            assert process.stdout.readline().strip() == "waiting"
+            assert process.poll() is None
+            (tmp_path / "ray_worker.env").write_text(
+                "RAY_NODE_IP_ADDRESS=10.0.0.2\nRAY_HEAD_IP=10.0.0.1\nRAY_PORT=6380\n"
+            )
+            stdout, stderr = process.communicate(input="\n", timeout=5)
+            assert process.returncode == 0, stderr
+            assert stdout == ""
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+        ready = subprocess.run(
+            ["bash", "-c", shell_functions + wait_command],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+        assert ready.stdout == ""
+
+        result = subprocess.run(
+            ["bash", "-c", shell_functions + stop_command + "; " + start_command],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.splitlines() == [
+            "ray stop",
+            "ray start --disable-usage-stats --node-ip-address 10.0.0.2 --address 10.0.0.1:6380",
+        ]
 
     def test_ray_bootstrap_merges_partial_generated_node_type_override(self):
         config = yaml.safe_load((Path(__file__).parent.parent / "examples/cluster.yaml").read_text())

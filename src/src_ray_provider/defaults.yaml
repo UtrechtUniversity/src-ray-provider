@@ -2,6 +2,7 @@ auth:
   ssh_user: ray
 
 head_start_ray_commands:
+  - until [ -f ray_head.env ]; do sleep 1; done
   - source ray_head.env && ray stop
   - >-
     source ray_head.env && ray start --head
@@ -14,6 +15,7 @@ head_start_ray_commands:
     --autoscaling-config=ray_bootstrap_config.yaml
 
 worker_start_ray_commands:
+  - until [ -f ray_worker.env ]; do sleep 1; done
   - source ray_worker.env && ray stop
   - >-
    source ray_worker.env && ray start

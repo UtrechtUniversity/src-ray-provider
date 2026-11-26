@@ -226,6 +226,10 @@ head node, so avoid using your normal private key. The provider reads the
 public-key file during bootstrap and passes its contents to the SRC catalog
 item.
 
+Before starting Ray on a worker, the default start commands wait for
+`ray_worker.env` to exist. If provisioning never creates the file, the worker
+start remains waiting until interrupted.
+
 The provider polls an SRC workspace until it reaches `running` before returning
 the node to Ray. When reuse is enabled it also waits for `paused` on termination.
 Each wait is bounded by `provider.workspace_creation_timeout`
